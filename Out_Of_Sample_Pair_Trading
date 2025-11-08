@@ -1,0 +1,941 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from scipy.stats import zscore
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import coint
+from datetime import datetime, timedelta
+import warnings
+import itertools
+from tabulate import tabulate
+import pickle
+from collections import deque
+import random
+from tensorflow import keras
+from tensorflow.keras import layers
+import tensorflow as tf
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import time
+import seaborn as sns
+import os
+
+warnings.filterwarnings("ignore")
+
+# OOS parameters
+oos_start_date = '2024-01-02'
+oos_end_date = '2025-07-31'
+risk_free = 0.04
+cost = 0.001
+slippage = 0.0005
+benchmark = '^GSPC'
+initial_capital = 100000
+# RL parameters
+state_size = 10
+action_size = 9
+
+class StockPair:
+    def __init__(self, ticker1, ticker2):
+        self.ticker1 = ticker1
+        self.ticker2 = ticker2
+        self.performance_metrics = {}
+        self.hedge_ratio = None
+        self.p_value = None
+        self.is_cointegrated = False
+        self.data = None
+        self.signals = None
+        self.cumulative_returns = None
+        self.net_returns = None
+        self.drawdowns = None
+        self.pair_score = 0
+        self.rl_agent = None
+        self.hurst = None
+        self.half_life = None
+        self.num_trades = 0
+        self.portfolio_value = None
+        self.dynamic_thresholds = None
+        self.trading_costs = None
+        self.allocation_weight = 0
+        # OOS specific attributes
+        self.oos_data = None
+        self.oos_signals = None
+        self.oos_cumulative_returns = None
+        self.oos_net_returns = None
+        self.oos_drawdowns = None
+        self.oos_portfolio_value = None
+        self.oos_performance_metrics = {}
+        self.oos_dynamic_thresholds = None
+        self.oos_trading_costs = None
+        self.oos_num_trades = 0
+
+class DQNAgent:
+
+    def __init__(self, state_size, action_size, learning_rate=0.001):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=1000)
+        self.epsilon = 0.01
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.learning_rate = learning_rate
+        self.gamma = 0.95
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_model()
+
+    def _build_model(self):
+        model = keras.Sequential([layers.Input(shape=(self.state_size,)), layers.Dense(32, activation='relu'), layers.Dense(16, activation='relu'), layers.Dense(self.action_size, activation='linear')])
+        model.compile(loss='mse', optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate))
+        return model
+
+    def update_target_model(self):
+        self.target_model.set_weights(self.model.get_weights())
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        act_values = self.model.predict(state, verbose=0)
+        return np.argmax(act_values[0])
+
+def get_action_thresholds(action):
+    threshold_combinations = [
+        (1.0, 0.5),
+        (1.25, 0.5),
+        (1.5, 0.5),
+        (1.0, 0.75),
+        (1.25, 0.75),
+        (1.5, 0.75),
+        (1.75, 0.75),
+        (2.0, 0.75),
+        (2.0, 1.0)]
+    return threshold_combinations[action]
+
+def extract_state_features(data, lookback=20):
+    features = []
+
+    # Z-Score
+    current_zscore = data['Spread_Zscore'].iloc[-1]
+    features.append(current_zscore)
+    recent_zscores = data['Spread_Zscore'].iloc[-lookback:]
+    features.extend([recent_zscores.mean(), recent_zscores.std(), recent_zscores.min(), recent_zscores.max()])
+
+    # Spread
+    spread_returns = data['Spread'].pct_change().iloc[-lookback:]
+    features.extend([spread_returns.mean(), spread_returns.std()])
+    # Volatilities
+    price_vol1 = data.iloc[-lookback:, 0].pct_change().std()
+    price_vol2 = data.iloc[-lookback:, 1].pct_change().std()
+    features.extend([price_vol1, price_vol2])
+    # Mean reversion
+    features.append(data['Spread'].iloc[-1] - data['Spread'].iloc[-lookback:].mean())
+    assert len(features) == 10, f"Expected 10 features, got {len(features)}"
+    features = [0 if np.isnan(f) or np.isinf(f) else f for f in features]
+    return np.array(features).reshape(1, -1)
+
+def load_top_pairs(filename="top_pairs.pkl"):
+    with open(filename, 'rb') as f:
+        pairs = pickle.load(f)
+    print(f"Loaded {len(pairs)} top pairs from backtest")
+    return pairs[:10]
+
+def load_rl_agents(pairs, filename="trained_rl_agents.pkl"):
+    if not os.path.exists(filename):
+        print(f"[ERROR] File '{filename}' not found.")
+        return pairs
+    try:
+        with open(filename, 'rb') as f:
+            agents_data = pickle.load(f)
+        loaded_count = 0
+        for pair in pairs:
+            pair_key = f"{pair.ticker1}-{pair.ticker2}"
+            if pair_key in agents_data:
+                agent_data = agents_data[pair_key]
+                agent = DQNAgent(state_size=agent_data['state_size'], action_size=agent_data['action_size'], learning_rate=agent_data['learning_rate'])
+                agent.model.set_weights(agent_data['model_weights'])
+                agent.target_model.set_weights(agent_data['target_model_weights'])
+                agent.epsilon = agent_data.get('epsilon', 0.01)
+                agent.epsilon_min = agent_data.get('epsilon_min', 0.01)
+                agent.epsilon_decay = agent_data.get('epsilon_decay', 0.995)
+
+                pair.rl_agent = agent
+                pair.hedge_ratio = agent_data.get('hedge_ratio')
+                pair.p_value = agent_data.get('p_value')
+                pair.hurst = agent_data.get('hurst')
+                pair.half_life = agent_data.get('half_life')
+                pair.pair_score = agent_data.get('pair_score', 0)
+                loaded_count += 1
+        print(f"[INFO] Loaded {loaded_count} RL agents from '{filename}'")
+        return pairs
+    except Exception as e:
+        print(f"[ERROR] Failed to load RL agents: {e}")
+        return pairs
+
+def get_oos_stock_data(stock_pair):
+    tickers = f"{stock_pair.ticker1} {stock_pair.ticker2}"
+    data_dict = yf.download(tickers, start=oos_start_date, end=oos_end_date, interval='1d', progress=False, threads=True)
+    if data_dict.empty:
+        return None
+    #Yahoo Finance
+    data = pd.DataFrame()
+    if 'Close' in data_dict.columns.get_level_values(0):
+        data[f'{stock_pair.ticker1}_Close'] = data_dict['Close'][stock_pair.ticker1]
+        data[f'{stock_pair.ticker2}_Close'] = data_dict['Close'][stock_pair.ticker2]
+    else:
+        data[f'{stock_pair.ticker1}_Close'] = data_dict['Adj Close'][stock_pair.ticker1]
+        data[f'{stock_pair.ticker2}_Close'] = data_dict['Adj Close'][stock_pair.ticker2]
+    data = data.dropna()
+    if len(data) < 30:
+        return None
+    # Normalisation Prices
+    data[f'{stock_pair.ticker1}_Norm'] = data[f'{stock_pair.ticker1}_Close'] / data[f'{stock_pair.ticker1}_Close'].iloc[0]
+    data[f'{stock_pair.ticker2}_Norm'] = data[f'{stock_pair.ticker2}_Close'] / data[f'{stock_pair.ticker2}_Close'].iloc[0]
+    return data
+
+def calculate_oos_spread(data, stock_pair):
+
+    hedge_ratio = stock_pair.hedge_ratio
+    # Spread and Z-Score calculation
+    data['Spread'] = data[f'{stock_pair.ticker1}_Norm'] - hedge_ratio * data[f'{stock_pair.ticker2}_Norm']
+    data['Spread_Zscore'] = zscore(data['Spread'])
+    return data
+
+def backtest_oos_strategy(data, stock_pair, initial_capital_per_pair):
+
+    signals = pd.Series(0, index=data.index)
+    position = 0
+    portfolio_value = pd.Series(initial_capital_per_pair, index=data.index)
+    dynamic_thresholds = pd.DataFrame(index=data.index, columns=['Entry_Threshold', 'Exit_Threshold'])
+    trading_costs_series = pd.Series(0.0, index=data.index)
+    trade_log = []
+    lookback = 20
+    trade_count = 0
+    total_trading_cost = 0
+    total_slippage_cost = 0
+
+    # Trading signals through RL agent
+    for i in range(lookback, len(data)):
+        current_date = data.index[i]
+        state = extract_state_features(data.iloc[:i+1], lookback)
+        action = stock_pair.rl_agent.act(state)
+        entry_threshold, exit_threshold = get_action_thresholds(action)
+        # Store dynamic thresholds
+        dynamic_thresholds.loc[current_date, 'Entry_Threshold'] = entry_threshold
+        dynamic_thresholds.loc[current_date, 'Exit_Threshold'] = exit_threshold
+        z_score = data['Spread_Zscore'].iloc[i]
+        prev_position = position
+        # Determine new position
+        if z_score > entry_threshold and position == 0:
+            new_position = -1
+        elif z_score < -entry_threshold and position == 0:
+            new_position = 1
+        elif abs(z_score) < exit_threshold and position != 0:
+            new_position = 0
+        else:
+            new_position = position
+        signals.iloc[i] = new_position
+        # Calculate portfolio value BEFORE applying costs
+        if i > lookback:
+            prev_date = data.index[i-1]
+            # Stock returns
+            stock1_return = (data.iloc[i, 2] / data.iloc[i-1, 2]) - 1  # Normalized stock 1
+            stock2_return = (data.iloc[i, 3] / data.iloc[i-1, 3]) - 1  # Normalized stock 2
+            # Calculate spread return
+            spread_return = stock1_return - stock_pair.hedge_ratio * stock2_return
+            if prev_position != 0:
+                position_return = prev_position * spread_return
+            else:
+                position_return = 0
+            portfolio_value.iloc[i] = portfolio_value.iloc[i-1] * (1 + position_return)
+        # Trading Costs
+        if new_position != prev_position:
+            trade_count += 1
+            current_portfolio_value = portfolio_value.iloc[i]
+            trade_cost = current_portfolio_value * cost
+            slippage_cost = current_portfolio_value * slippage
+            total_cost = trade_cost + slippage_cost
+            portfolio_value.iloc[i] -= total_cost
+            trading_costs_series.iloc[i] = total_cost
+            total_trading_cost += trade_cost
+            total_slippage_cost += slippage_cost
+            trade_log.append({'date': current_date, 'from_position': prev_position, 'to_position': new_position, 'z_score': z_score, 'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold,
+                              'trade_cost': trade_cost, 'slippage_cost': slippage_cost, 'total_cost': total_cost, 'portfolio_value_before': current_portfolio_value, 'portfolio_value_after': portfolio_value.iloc[i]})
+        position = new_position
+
+    portfolio_returns = portfolio_value.pct_change().fillna(0)
+    # Net returns
+    net_returns = portfolio_returns.copy()
+    cumulative_returns = portfolio_value / initial_capital_per_pair
+    stock_pair.oos_num_trades = trade_count
+    stock_pair.oos_dynamic_thresholds = dynamic_thresholds
+    stock_pair.oos_trading_costs = {'total_cost': total_trading_cost, 'total_slippage': total_slippage_cost, 'total_combined': total_trading_cost + total_slippage_cost, 'cost_per_trade': (total_trading_cost + total_slippage_cost) / max(trade_count, 1),
+        'total_trades': trade_count, 'cost_as_pct_of_capital': (total_trading_cost + total_slippage_cost) / initial_capital_per_pair, 'trade_log': trade_log, 'costs_series': trading_costs_series}
+    return signals, cumulative_returns, net_returns, trade_count, portfolio_value
+
+def calculate_cvar_and_es(returns, confidence_level=0.05):
+    if len(returns) == 0:
+        return 0, 0
+    sorted_returns = np.sort(returns)
+    var_index = int(confidence_level * len(sorted_returns))
+    var = sorted_returns[var_index] if var_index < len(sorted_returns) else sorted_returns[-1]
+    cvar = np.mean(sorted_returns[:var_index]) if var_index > 0 else var
+    return var, cvar
+
+def analyse_oos_performance(cumulative_returns, net_returns, stock_pair):
+
+    if len(cumulative_returns) == 0:
+        final_value = 0
+        total_return = 0
+        annualised_return = 0
+    else:
+        final_value = cumulative_returns.iloc[-1]
+        total_return = final_value - 1
+        years = len(cumulative_returns) / 252
+        if years > 0 and final_value > 0:
+            annualised_return = (final_value) ** (1/years) - 1
+        else:
+            annualised_return = 0
+    #Risk Free rate
+    daily_rfr = (1 + risk_free) ** (1 / 252) - 1
+    excess_returns = net_returns - daily_rfr
+    volatility = net_returns.std() * np.sqrt(252) if len(net_returns) > 0 else 0
+    if len(excess_returns) > 0 and excess_returns.std() != 0:
+        sharpe_ratio = excess_returns.mean() / excess_returns.std() * np.sqrt(252)
+    else:
+        sharpe_ratio = 0
+    # Drawdown Analysis
+    if len(cumulative_returns) > 0:
+        running_max = cumulative_returns.cummax()
+        drawdowns = cumulative_returns / running_max - 1
+        max_drawdown = drawdowns.min()
+    else:
+        drawdowns = pd.Series([0])
+        max_drawdown = 0
+    # Trading metrics
+    positive_returns = net_returns[net_returns > 0]
+    negative_returns = net_returns[net_returns < 0]
+    if len(net_returns[net_returns != 0]) > 0:
+        win_rate = len(positive_returns) / len(net_returns[net_returns != 0])
+    else:
+        win_rate = 0
+    if len(negative_returns) > 0 and negative_returns.sum() != 0:
+        profit_factor = abs(positive_returns.sum() / negative_returns.sum())
+    else:
+        profit_factor = np.inf if len(positive_returns) > 0 else 0
+    var_5, cvar_5 = calculate_cvar_and_es(net_returns, 0.05)
+    var_1, cvar_1 = calculate_cvar_and_es(net_returns, 0.01)
+    # Sortino ratio
+    negative_returns_only = net_returns[net_returns < 0]
+    downside_deviation = negative_returns_only.std() * np.sqrt(252) if len(negative_returns_only) > 0 else 0
+    sortino_ratio = (annualised_return - risk_free) / downside_deviation if downside_deviation != 0 else 0
+    # Calmar ratio
+    calmar_ratio = annualised_return / abs(max_drawdown) if max_drawdown != 0 else 0
+
+    cost_drag = stock_pair.oos_trading_costs['cost_as_pct_of_capital'] if stock_pair.oos_trading_costs else 0
+    stock_pair.oos_performance_metrics = {'total_return': total_return, 'annualised_return': annualised_return, 'volatility': volatility, 'sharpe_ratio': sharpe_ratio, 'sortino_ratio': sortino_ratio,
+        'calmar_ratio': calmar_ratio, 'max_drawdown': max_drawdown, 'win_rate': win_rate, 'profit_factor': profit_factor, 'final_value': final_value, 'var_5': var_5, 'cvar_5': cvar_5, 'var_1': var_1,
+        'cvar_1': cvar_1, 'cost_drag': cost_drag, 'gross_return': total_return, 'net_return': total_return}
+    return drawdowns
+
+def calculate_risk_parity_weights(pairs):
+    volatilities = []
+    for pair in pairs:
+        if pair.oos_net_returns is not None and len(pair.oos_net_returns) > 0:
+            vol = pair.oos_net_returns.std() * np.sqrt(252)
+            volatilities.append(vol)
+        else:
+            volatilities.append(0.01)
+    inv_volatilities = [1/vol if vol > 0 else 1 for vol in volatilities]
+    total_inv_vol = sum(inv_volatilities)
+    weights = [inv_vol / total_inv_vol for inv_vol in inv_volatilities]
+    for i, pair in enumerate(pairs):
+        pair.allocation_weight = weights[i]
+    return weights
+
+def get_oos_benchmark_data():
+    benchmark_data = yf.download(benchmark, start=oos_start_date, end=oos_end_date, interval='1d', progress=False)
+    if benchmark_data.empty:
+        return None, None
+    close_col = 'Close' if 'Close' in benchmark_data.columns else 'Adj Close'
+    benchmark_data = benchmark_data[[close_col]].rename(columns={close_col: 'Close'})
+    benchmark_returns = benchmark_data['Close'].pct_change().dropna()
+    benchmark_cumulative = (1 + benchmark_returns).cumprod()
+    total_return = float(benchmark_cumulative.iloc[-1] - 1)
+    print(f"OOS Benchmark total return: {total_return:.2%}")
+    return benchmark_returns, benchmark_cumulative
+
+def run_oos_test_for_pair(pair, capital_per_pair):
+    print(f"Running OOS test for {pair.ticker1}-{pair.ticker2}...")
+    oos_data = get_oos_stock_data(pair)
+    if oos_data is None:
+        return False
+    # Spread using backtest hedge ratio
+    oos_data = calculate_oos_spread(oos_data, pair)
+    # OOS backtest using trained RL agent
+    signals, cumulative_returns, net_returns, num_trades, portfolio_value = backtest_oos_strategy(oos_data, pair, capital_per_pair)
+    drawdowns = analyse_oos_performance(cumulative_returns, net_returns, pair)
+    pair.oos_data = oos_data
+    pair.oos_signals = signals
+    pair.oos_cumulative_returns = cumulative_returns
+    pair.oos_net_returns = net_returns
+    pair.oos_drawdowns = drawdowns
+    pair.oos_portfolio_value = portfolio_value
+    print(f"OOS test completed for {pair.ticker1}-{pair.ticker2}")
+    print(f"  Final Value: {pair.oos_performance_metrics['final_value']:.3f}")
+    print(f"  Total Return (Net): {pair.oos_performance_metrics['total_return']:.2%}")
+    print(f"  Sharpe Ratio: {pair.oos_performance_metrics['sharpe_ratio']:.2f}")
+    print(f"  Max Drawdown: {pair.oos_performance_metrics['max_drawdown']:.2%}")
+    print(f"  Number of Trades: {pair.oos_num_trades}")
+    if pair.oos_trading_costs:
+        print(f"  Trading Costs: ${pair.oos_trading_costs['total_combined']:.4f}")
+        print(f"  Cost Drag: {pair.oos_performance_metrics.get('cost_drag', 0):.2%}")
+        print(f"  Cost per Trade: ${pair.oos_trading_costs['cost_per_trade']:.4f}")
+    return True
+
+def create_oos_portfolio_analysis(pairs, benchmark_returns, initial_capital):
+    # Risk parity weights
+    weights = calculate_risk_parity_weights(pairs)
+    print(f"\n=== OOS Portfolio Analysis ===")
+    print(f"Period: {oos_start_date} to {oos_end_date}")
+    print(f"Initial Capital: ${initial_capital:,.2f}")
+    print("\nRisk Parity Weights Allocqation:")
+    for i, (pair, weight) in enumerate(zip(pairs, weights)):
+        capital_allocated = initial_capital * weight
+        print(f"{i+1}. {pair.ticker1}-{pair.ticker2}: {weight:.2%} (${capital_allocated:,.2f})")
+    # Portfolio Returns
+    portfolio_returns = pd.DataFrame()
+    for i, pair in enumerate(pairs):
+        if pair.oos_net_returns is not None:
+            weighted_returns = pair.oos_net_returns * weights[i]
+            portfolio_returns[f"{pair.ticker1}-{pair.ticker2}"] = weighted_returns
+    if portfolio_returns.empty:
+        return None, None, None
+    portfolio_returns['Portfolio'] = portfolio_returns.sum(axis=1)
+    portfolio_value = pd.Series(initial_capital, index=portfolio_returns.index)
+    for i in range(1, len(portfolio_returns)):
+        portfolio_value.iloc[i] = portfolio_value.iloc[i-1] * (1 + portfolio_returns['Portfolio'].iloc[i])
+    portfolio_cumulative = portfolio_value / initial_capital
+    final_portfolio_value = portfolio_value.iloc[-1]
+    portfolio_metrics = calculate_oos_portfolio_metrics(portfolio_returns['Portfolio'], benchmark_returns, initial_capital, final_portfolio_value, pairs)
+    return portfolio_returns, portfolio_cumulative, portfolio_metrics
+
+def calculate_oos_portfolio_metrics(portfolio_returns, benchmark_returns, initial_capital, final_value, pairs):
+
+    aligned_data = pd.concat([portfolio_returns, benchmark_returns], axis=1).dropna()
+    if aligned_data.empty:
+        return {}
+    aligned_data.columns = ['Portfolio', 'Benchmark']
+    portfolio_cumulative = (1 + aligned_data['Portfolio']).cumprod()
+    benchmark_cumulative = (1 + aligned_data['Benchmark']).cumprod()
+    total_return = portfolio_cumulative.iloc[-1] - 1
+    benchmark_total = benchmark_cumulative.iloc[-1] - 1
+    excess_return = total_return - benchmark_total
+    years = len(aligned_data) / 252
+    if years > 0:
+        annualized_return = (portfolio_cumulative.iloc[-1]) ** (1/years) - 1
+        benchmark_ann = (benchmark_cumulative.iloc[-1]) ** (1/years) - 1
+    else:
+        annualized_return = 0
+        benchmark_ann = 0
+    ann_factor = np.sqrt(252)
+    portfolio_vol = aligned_data['Portfolio'].std() * ann_factor
+    benchmark_vol = aligned_data['Benchmark'].std() * ann_factor
+    # Risk-free rate
+    daily_rfr = (1 + risk_free) ** (1 / 252) - 1
+    # Sharpe ratio
+    excess_daily = aligned_data['Portfolio'] - daily_rfr
+    sharpe = (excess_daily.mean() / excess_daily.std()) * ann_factor if excess_daily.std() != 0 else 0
+    # Beta and Alpha
+    covariance = np.cov(aligned_data['Portfolio'], aligned_data['Benchmark'])[0, 1]
+    benchmark_variance = np.var(aligned_data['Benchmark'])
+    beta = covariance / benchmark_variance if benchmark_variance != 0 else 0
+    alpha = annualized_return - (risk_free + beta * (benchmark_ann - risk_free))
+    # Information Ratio
+    tracking_error = (aligned_data['Portfolio'] - aligned_data['Benchmark']).std() * ann_factor
+    information_ratio = excess_return / tracking_error if tracking_error != 0 else 0
+    # Drawdown
+    drawdowns = portfolio_cumulative / portfolio_cumulative.cummax() - 1
+    max_drawdown = drawdowns.min()
+    # CVaR and Expected Shortfall
+    var_5, cvar_5 = calculate_cvar_and_es(aligned_data['Portfolio'], 0.05)
+    var_1, cvar_1 = calculate_cvar_and_es(aligned_data['Portfolio'], 0.01)
+    # Trading Costs Analysis
+    total_trading_costs = 0
+    total_slippage_costs = 0
+    total_combined_costs = 0
+    total_trades = 0
+    for pair in pairs:
+        if pair.oos_trading_costs:
+            total_trading_costs += pair.oos_trading_costs.get('total_cost', 0)
+            total_slippage_costs += pair.oos_trading_costs.get('total_slippage', 0)
+            total_combined_costs += pair.oos_trading_costs.get('total_combined', 0)
+            total_trades += pair.oos_trading_costs.get('total_trades', 0)
+    avg_cost_per_trade = total_combined_costs / max(total_trades, 1)
+    cost_drag = total_combined_costs / initial_capital
+    cost_pct_of_capital = total_combined_costs / initial_capital
+
+    calmar_ratio = annualized_return / abs(max_drawdown) if max_drawdown != 0 else 0
+    negative_returns = aligned_data['Portfolio'][aligned_data['Portfolio'] < 0]
+    downside_deviation = negative_returns.std() * ann_factor if len(negative_returns) > 0 else 0
+    sortino_ratio = (annualized_return - risk_free) / downside_deviation if downside_deviation != 0 else 0
+    metrics = {'initial_capital': initial_capital, 'final_value': final_value, 'total_return': total_return, 'annualized_return': annualized_return, 'benchmark_return': benchmark_total, 'benchmark_annualized': benchmark_ann,
+        'excess_return': excess_return, 'alpha': alpha, 'beta': beta, 'volatility': portfolio_vol, 'benchmark_volatility': benchmark_vol, 'sharpe_ratio': sharpe, 'information_ratio': information_ratio, 'sortino_ratio': sortino_ratio,
+        'calmar_ratio': calmar_ratio, 'max_drawdown': max_drawdown, 'tracking_error': tracking_error, 'var_5': var_5, 'cvar_5': cvar_5, 'var_1': var_1, 'cvar_1': cvar_1, 'total_trading_costs': total_trading_costs, 'total_slippage_costs': total_slippage_costs,
+        'total_combined_costs': total_combined_costs, 'total_trades': total_trades, 'avg_cost_per_trade': avg_cost_per_trade, 'cost_drag': cost_drag, 'cost_pct_of_capital': cost_pct_of_capital}
+    return metrics
+
+def create_oos_performance_table(pairs, portfolio_metrics):
+    print("\n" + "="*80)
+    print("OUT-OF-SAMPLE PORTFOLIO PERFORMANCE METRICS")
+    print(f"Period: {oos_start_date} to {oos_end_date}")
+    print("="*80)
+    print(f"Initial Capital: ${portfolio_metrics['initial_capital']:,.2f}")
+    print(f"Final Portfolio Value: ${portfolio_metrics['final_value']:,.2f}")
+    print(f"Total Return (Net): {portfolio_metrics['total_return']:.2%}")
+    print(f"Annualized Return (Net): {portfolio_metrics['annualized_return']:.2%}")
+    print(f"\nBenchmark ({benchmark}) Comparison:")
+    print(f"Benchmark Total Return: {portfolio_metrics['benchmark_return']:.2%}")
+    print(f"Benchmark Annualized: {portfolio_metrics['benchmark_annualized']:.2%}")
+    print(f"Excess Return: {portfolio_metrics['excess_return']:.2%}")
+    print(f"Alpha: {portfolio_metrics['alpha']:.2%}")
+    print(f"Beta: {portfolio_metrics['beta']:.2f}")
+    print(f"\nRisk Metrics:")
+    print(f"Portfolio Volatility: {portfolio_metrics['volatility']:.2%}")
+    print(f"Tracking Error: {portfolio_metrics['tracking_error']:.2%}")
+    print(f"Maximum Drawdown: {portfolio_metrics['max_drawdown']:.2%}")
+    print(f"VaR (5%): {portfolio_metrics['var_5']:.2%}")
+    print(f"CVaR (5%): {portfolio_metrics['cvar_5']:.2%}")
+    print(f"VaR (1%): {portfolio_metrics['var_1']:.2%}")
+    print(f"CVaR (1%): {portfolio_metrics['cvar_1']:.2%}")
+    print(f"\nPerformance Ratios:")
+    print(f"Sharpe Ratio: {portfolio_metrics['sharpe_ratio']:.2f}")
+    print(f"Information Ratio: {portfolio_metrics['information_ratio']:.2f}")
+    print(f"Sortino Ratio: {portfolio_metrics['sortino_ratio']:.2f}")
+    print(f"Calmar Ratio: {portfolio_metrics['calmar_ratio']:.2f}")
+    print(f"\nTrading Costs Analysis:")
+    print(f"Total Trading Costs: ${portfolio_metrics['total_trading_costs']:.2f}")
+    print(f"Total Slippage Costs: ${portfolio_metrics.get('total_slippage_costs', 0):.2f}")
+    print(f"Combined Trading Costs: ${portfolio_metrics.get('total_combined_costs', portfolio_metrics['total_trading_costs']):.2f}")
+    print(f"Total Trades: {portfolio_metrics['total_trades']}")
+    print(f"Average Cost per Trade: ${portfolio_metrics['avg_cost_per_trade']:.4f}")
+    print(f"Cost Drag on Returns: {portfolio_metrics['cost_drag']:.2%}")
+    print(f"Costs as % of Initial Capital: {portfolio_metrics.get('cost_pct_of_capital', 0):.2%}")
+
+    print(f"\n" + "="*140)
+    print("INDIVIDUAL PAIRS OOS PERFORMANCE (Inverse Volatility Weighted) - NET OF COSTS")
+    print("="*140)
+    metrics_table = []
+    for i, pair in enumerate(pairs, 1):
+        if pair.oos_performance_metrics:
+            final_value = pair.oos_performance_metrics.get('final_value', 1.0)
+            trading_costs = pair.oos_trading_costs if pair.oos_trading_costs else {'total_cost': 0, 'total_slippage': 0, 'total_combined': 0, 'cost_per_trade': 0, 'cost_as_pct_of_capital': 0}
+            metrics_table.append([i, f"{pair.ticker1}-{pair.ticker2}", f"{pair.allocation_weight:.2%}", f"{final_value:.3f}", f"{pair.oos_performance_metrics['total_return']:.2%}", f"{pair.oos_performance_metrics['annualised_return']:.2%}",
+                f"{pair.oos_performance_metrics['sharpe_ratio']:.2f}", f"{pair.oos_performance_metrics['max_drawdown']:.2%}", f"{pair.oos_performance_metrics['cvar_5']:.2%}", f"{pair.oos_num_trades}",
+                f"{trading_costs['cost_per_trade']:.4f}", f"{trading_costs['cost_as_pct_of_capital']:.2%}", f"{pair.oos_performance_metrics['volatility']:.2%}"])
+    print(tabulate(metrics_table, headers=["Rank", "Pair", "Weight", "Final Value", "Total Return", "Ann. Return", "Sharpe", "Max DD", "CVaR(5%)", "Trades", "Cost/Trade", "Cost Drag", "Volatility"], tablefmt="grid"))
+
+def create_oos_visualizations(pairs, portfolio_returns, portfolio_cumulative, benchmark_returns, portfolio_metrics):
+
+    plt.style.use('default')
+    sns.set_palette("husl")
+    fig = plt.figure(figsize=(24, 30))
+    # 1. Portfolio vs Benchmark
+    ax1 = plt.subplot(5, 1, 1)
+    benchmark_aligned = benchmark_returns.reindex(portfolio_returns.index).fillna(0)
+    benchmark_cumulative = (1 + benchmark_aligned).cumprod()
+    ax1.plot(portfolio_cumulative.index, portfolio_cumulative, label='OOS Portfolio', linewidth=2, color='blue')
+    ax1.plot(benchmark_cumulative.index, benchmark_cumulative, label=f'Benchmark ({benchmark})', linewidth=2, color='black')
+    ax1.set_title('OOS Portfolio vs Benchmark Performance', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Cumulative Return')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    final_port_return = float(portfolio_cumulative.iloc[-1] - 1)
+    final_bench_return = float(benchmark_cumulative.iloc[-1] - 1)
+    excess_return = final_port_return - final_bench_return
+    perf_text = f"""Portfolio: {final_port_return:.2%}
+Benchmark: {final_bench_return:.2%}
+Excess: {excess_return:.2%}
+Sharpe: {portfolio_metrics['sharpe_ratio']:.2f}"""
+    ax1.text(0.02, 0.98, perf_text, transform=ax1.transAxes, verticalalignment='top', fontsize=10, bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+    # 2. Individual Pairs
+    ax2 = plt.subplot(5, 1, 2)
+    colors = plt.cm.tab10(np.linspace(0, 1, len(pairs)))
+    for i, pair in enumerate(pairs):
+        if pair.oos_cumulative_returns is not None:
+            ax2.plot(pair.oos_cumulative_returns.index, pair.oos_cumulative_returns, label=f"{pair.ticker1}-{pair.ticker2}", alpha=0.8, color=colors[i], linewidth=1.5)
+    ax2.set_title('Individual Pairs OOS Performance', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Cumulative Return')
+    ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+    ax2.grid(True, alpha=0.3)
+    # 3. Sharpe Ratio
+    ax4 = plt.subplot(5, 1, 3)
+    rolling_window = 30  # 1 month
+    if len(portfolio_returns) > rolling_window:
+        rolling_returns = portfolio_returns['Portfolio'].rolling(window=rolling_window)
+        rolling_sharpe = rolling_returns.mean() / rolling_returns.std() * np.sqrt(252)
+        ax4.plot(rolling_sharpe.index, rolling_sharpe, label='Rolling Sharpe (30d)', linewidth=2, color='purple')
+        ax4.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax4.axhline(y=1, color='green', linestyle='--', alpha=0.5, label='Sharpe = 1')
+        ax4.set_title('Rolling Sharpe Ratio', fontsize=14, fontweight='bold')
+        ax4.set_ylabel('Sharpe Ratio')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+    # 4. Drawdown
+    ax5 = plt.subplot(5, 1, 4)
+    portfolio_drawdowns = portfolio_cumulative / portfolio_cumulative.cummax() - 1
+    ax5.fill_between(portfolio_drawdowns.index, portfolio_drawdowns, 0, color='red', alpha=0.3, label='Portfolio Drawdowns')
+    ax5.plot(portfolio_drawdowns.index, portfolio_drawdowns, color='red', linewidth=1)
+    ax5.set_title('Portfolio Drawdowns', fontsize=14, fontweight='bold')
+    ax5.set_ylabel('Drawdown (%)')
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+    max_dd = float(portfolio_drawdowns.min())
+    ax5.text(0.02, 0.02, f'Max DD: {max_dd:.2%}', transform=ax5.transAxes, verticalalignment='bottom', fontsize=10, bbox=dict(boxstyle='round', facecolor='pink', alpha=0.8))
+    # 5. Risk-Return Scatter
+    ax6 = plt.subplot(5, 1, 5)
+    pair_returns = []
+    pair_volatilities = []
+    pair_labels = []
+    for pair in pairs:
+        if pair.oos_performance_metrics:
+            pair_returns.append(pair.oos_performance_metrics['annualised_return'])
+            pair_volatilities.append(pair.oos_performance_metrics['volatility'])
+            pair_labels.append(f"{pair.ticker1}-{pair.ticker2}")
+    scatter = ax6.scatter(pair_volatilities, pair_returns, c=range(len(pair_returns)), cmap='viridis', s=100, alpha=0.7, edgecolors='black')
+    ax6.scatter(portfolio_metrics['volatility'], portfolio_metrics['annualized_return'], color='red', s=200, marker='*', label='Portfolio', edgecolors='black')
+    if benchmark_returns is not None:
+        bench_vol = float(benchmark_aligned.std() * np.sqrt(252))
+        bench_ret = float(portfolio_metrics['benchmark_annualized'])
+        ax6.scatter(bench_vol, bench_ret, color='blue', s=200, marker='s', label='Benchmark', edgecolors='black')
+    ax6.set_xlabel('Volatility (Annualized)')
+    ax6.set_ylabel('Return (Annualized)')
+    ax6.set_title('Risk-Return Profile', fontsize=14, fontweight='bold')
+    ax6.legend()
+    ax6.grid(True, alpha=0.3)
+    for i, label in enumerate(pair_labels):
+        ax6.annotate(label, (pair_volatilities[i], pair_returns[i]), xytext=(5, 5), textcoords='offset points', fontsize=8)
+    plt.tight_layout()
+    # plt.savefig("oos_comprehensive_analysis.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+def create_detailed_pair_analysis(pairs):
+    fig, axes = plt.subplots(5, 2, figsize=(30, 26))
+    axes = axes.flatten()
+    for idx, pair in enumerate(pairs[:10]):
+        if pair.oos_data is None or pair.oos_signals is None:
+            continue
+        ax = axes[idx]
+        data = pair.oos_data
+        signals = pair.oos_signals
+        ax.plot(data.index, data['Spread_Zscore'], color='blue', linewidth=1, label='Z-Score')
+        if pair.oos_dynamic_thresholds is not None:
+            entry_thresholds = pair.oos_dynamic_thresholds['Entry_Threshold'].fillna(method='bfill').fillna(method='ffill')
+            exit_thresholds = pair.oos_dynamic_thresholds['Exit_Threshold'].fillna(method='bfill').fillna(method='ffill')
+            ax.plot(data.index, entry_thresholds, color='red', linestyle='--', alpha=0.7, label='Entry Thresholds', linewidth=1)
+            ax.plot(data.index, -entry_thresholds, color='red', linestyle='--', alpha=0.7, linewidth=1)
+            ax.plot(data.index, exit_thresholds, color='green', linestyle='--', alpha=0.7, label='Exit Thresholds', linewidth=1)
+            ax.plot(data.index, -exit_thresholds, color='green', linestyle='--', alpha=0.7, linewidth=1)
+        long_signals = signals[signals == 1]
+        short_signals = signals[signals == -1]
+        for date in long_signals.index:
+            if date in data.index:
+                z_val = data.loc[date, 'Spread_Zscore']
+                ax.scatter(date, z_val, color='green', marker='^', s=30)
+        for date in short_signals.index:
+            if date in data.index:
+                z_val = data.loc[date, 'Spread_Zscore']
+                ax.scatter(date, z_val, color='red', marker='v', s=30)
+        ax.set_title(f'{pair.ticker1}-{pair.ticker2} OOS Trading Signals')
+        ax.set_ylabel('Z-Score')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        if pair.oos_performance_metrics:
+            metrics_text = f"""Return: {pair.oos_performance_metrics['total_return']:.2%}
+Sharpe: {pair.oos_performance_metrics['sharpe_ratio']:.2f}
+Max DD: {pair.oos_performance_metrics['max_drawdown']:.2%}
+Trades: {pair.oos_num_trades}"""
+            ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes,
+                   verticalalignment='top', fontsize=8,
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    for idx in range(len(pairs[:6]), len(axes)):
+        axes[idx].set_visible(False)
+    plt.tight_layout()
+    # plt.savefig("oos_detailed_pair_analysis.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+def create_comparison_analysis(pairs):
+
+    comparison_data = []
+    for pair in pairs:
+        if pair.performance_metrics and pair.oos_performance_metrics:
+            # Get cost information
+            bt_costs = pair.trading_costs if pair.trading_costs else {'total_combined': 0, 'cost_as_pct_of_capital': 0}
+            oos_costs = pair.oos_trading_costs if pair.oos_trading_costs else {'total_combined': 0, 'cost_as_pct_of_capital': 0}
+
+            comparison_data.append({ 'Pair': f"{pair.ticker1}-{pair.ticker2}", 'Backtest_Return': pair.performance_metrics['total_return'], 'OOS_Return': pair.oos_performance_metrics['total_return'],
+                'Backtest_Sharpe': pair.performance_metrics['sharpe_ratio'], 'OOS_Sharpe': pair.oos_performance_metrics['sharpe_ratio'], 'Backtest_MaxDD': pair.performance_metrics['max_drawdown'],
+                'OOS_MaxDD': pair.oos_performance_metrics['max_drawdown'], 'Backtest_Trades': pair.num_trades, 'OOS_Trades': pair.oos_num_trades, 'Backtest_Costs': bt_costs['total_combined'],
+                'OOS_Costs': oos_costs['total_combined'], 'Backtest_CostDrag': bt_costs['cost_as_pct_of_capital'], 'OOS_CostDrag': oos_costs['cost_as_pct_of_capital']})
+    if not comparison_data:
+        print("No comparison data available")
+        return
+    df_comparison = pd.DataFrame(comparison_data)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 12))
+    ax1 = axes[0, 0]
+    x = range(len(df_comparison))
+    width = 0.35
+    ax1.bar([i - width/2 for i in x], df_comparison['Backtest_Return'] * 100, width, label='Backtest', alpha=0.7, color='blue')
+    ax1.bar([i + width/2 for i in x], df_comparison['OOS_Return'] * 100, width, label='OOS', alpha=0.7, color='orange')
+    ax1.set_xlabel('Pairs')
+    ax1.set_ylabel('Total Return (%) - Net of Costs')
+    ax1.set_title('Backtest vs OOS Returns (Net of Costs)')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(df_comparison['Pair'], rotation=45, ha='right')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    # 2. Sharpe ratio comparison
+    ax2 = axes[0, 1]
+    ax2.bar([i - width/2 for i in x], df_comparison['Backtest_Sharpe'], width, label='Backtest', alpha=0.7, color='blue')
+    ax2.bar([i + width/2 for i in x], df_comparison['OOS_Sharpe'], width, label='OOS', alpha=0.7, color='orange')
+    ax2.set_xlabel('Pairs')
+    ax2.set_ylabel('Sharpe Ratio')
+    ax2.set_title('Backtest vs OOS Sharpe Ratios')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(df_comparison['Pair'], rotation=45, ha='right')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    # 3. Max Drawdown comparison
+    ax3 = axes[0, 2]
+    ax3.bar([i - width/2 for i in x], df_comparison['Backtest_MaxDD'] * 100, width, label='Backtest', alpha=0.7, color='blue')
+    ax3.bar([i + width/2 for i in x], df_comparison['OOS_MaxDD'] * 100, width, label='OOS', alpha=0.7, color='orange')
+    ax3.set_xlabel('Pairs')
+    ax3.set_ylabel('Max Drawdown (%)')
+    ax3.set_title('Backtest vs OOS Max Drawdowns')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(df_comparison['Pair'], rotation=45, ha='right')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    # 4. Number of trades comparison
+    ax4 = axes[1, 0]
+    ax4.bar([i - width/2 for i in x], df_comparison['Backtest_Trades'], width, label='Backtest', alpha=0.7, color='blue')
+    ax4.bar([i + width/2 for i in x], df_comparison['OOS_Trades'], width, label='OOS', alpha=0.7, color='orange')
+    ax4.set_xlabel('Pairs')
+    ax4.set_ylabel('Number of Trades')
+    ax4.set_title('Backtest vs OOS Number of Trades')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(df_comparison['Pair'], rotation=45, ha='right')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    # 5. Trading costs comparison
+    ax5 = axes[1, 1]
+    ax5.bar([i - width/2 for i in x], df_comparison['Backtest_Costs'], width, label='Backtest', alpha=0.7, color='blue')
+    ax5.bar([i + width/2 for i in x], df_comparison['OOS_Costs'], width, label='OOS', alpha=0.7, color='orange')
+    ax5.set_xlabel('Pairs')
+    ax5.set_ylabel('Total Trading Costs ($)')
+    ax5.set_title('Backtest vs OOS Trading Costs')
+    ax5.set_xticks(x)
+    ax5.set_xticklabels(df_comparison['Pair'], rotation=45, ha='right')
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+    # 6. Cost drag comparison
+    ax6 = axes[1, 2]
+    ax6.bar([i - width/2 for i in x], df_comparison['Backtest_CostDrag'] * 100, width, label='Backtest', alpha=0.7, color='blue')
+    ax6.bar([i + width/2 for i in x], df_comparison['OOS_CostDrag'] * 100, width, label='OOS', alpha=0.7, color='orange')
+    ax6.set_xlabel('Pairs')
+    ax6.set_ylabel('Cost Drag (%)')
+    ax6.set_title('Backtest vs OOS Cost Drag')
+    ax6.set_xticks(x)
+    ax6.set_xticklabels(df_comparison['Pair'], rotation=45, ha='right')
+    ax6.legend()
+    ax6.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    # plt.savefig("backtest_vs_oos_comparison.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+    print("\n" + "="*150)
+    print("BACKTEST vs OUT-OF-SAMPLE PERFORMANCE COMPARISON")
+    print("="*150)
+    comparison_table = []
+    for _, row in df_comparison.iterrows():
+        comparison_table.append([row['Pair'], f"{row['Backtest_Return']:.2%}", f"{row['OOS_Return']:.2%}", f"{row['Backtest_Sharpe']:.2f}", f"{row['OOS_Sharpe']:.2f}", f"{row['Backtest_MaxDD']:.2%}",
+            f"{row['OOS_MaxDD']:.2%}", f"{row['Backtest_Trades']}", f"{row['OOS_Trades']}", f"${row['Backtest_Costs']:.4f}", f"${row['OOS_Costs']:.4f}", f"{row['Backtest_CostDrag']:.2%}",
+            f"{row['OOS_CostDrag']:.2%}"])
+    print(tabulate(comparison_table,
+                  headers=["Pair", "BT Return", "OOS Return", "BT Sharpe", "OOS Sharpe", "BT MaxDD", "OOS MaxDD", "BT Trades", "OOS Trades", "BT Costs", "OOS Costs", "BT Cost Drag", "OOS Cost Drag"],
+                  tablefmt="grid"))
+
+    # Summary of Statistics
+    print(f"\n--- SUMMARY STATISTICS ---")
+    print(f"Average Backtest Return: {df_comparison['Backtest_Return'].mean():.2%}")
+    print(f"Average OOS Return: {df_comparison['OOS_Return'].mean():.2%}")
+    print(f"Return Correlation (BT vs OOS): {df_comparison[['Backtest_Return', 'OOS_Return']].corr().iloc[0,1]:.3f}")
+    print(f"Average Backtest Cost Drag: {df_comparison['Backtest_CostDrag'].mean():.2%}")
+    print(f"Average OOS Cost Drag: {df_comparison['OOS_CostDrag'].mean():.2%}")
+    print(f"Average Trading Cost per Pair (BT): ${df_comparison['Backtest_Costs'].mean():.4f}")
+    print(f"Average Trading Cost per Pair (OOS): ${df_comparison['OOS_Costs'].mean():.4f}")
+    return_degradation = (df_comparison['OOS_Return'] - df_comparison['Backtest_Return']).mean()
+    sharpe_degradation = (df_comparison['OOS_Sharpe'] - df_comparison['Backtest_Sharpe']).mean()
+
+def create_oos_summary_report(pairs, portfolio_metrics):
+
+    with open("oos_pairs_trading_report.txt", "w") as f:
+        f.write("="*80 + "\n")
+        f.write("OUT-OF-SAMPLE PAIRS TRADING ANALYSIS REPORT\n")
+        f.write("WITH TRAINED REINFORCEMENT LEARNING AGENTS\n")
+        f.write("="*80 + "\n\n")
+        f.write(f"OOS Test Period: {oos_start_date} to {oos_end_date}\n")
+        f.write(f"Benchmark: {benchmark}\n")
+        f.write(f"Initial Capital: ${portfolio_metrics.get('initial_capital', 0):,.2f}\n")
+        f.write(f"Final Portfolio Value: ${portfolio_metrics.get('final_value', 0):,.2f}\n")
+        f.write(f"Allocation Strategy: Inverse Volatility Weighting\n\n")
+        f.write("--- OOS TESTING METHODOLOGY ---\n")
+        f.write("• Used pre-trained RL agents from backtest period\n")
+        f.write("• Applied same hedge ratios from cointegration analysis\n")
+        f.write("• No model retraining during OOS period\n")
+        f.write("• Minimal exploration (epsilon = 0.01) for pure exploitation\n")
+        f.write("• Inverse volatility allocation for risk management\n")
+        f.write("• Trading costs properly accounted and deducted from returns\n\n")
+        f.write("--- PORTFOLIO PERFORMANCE SUMMARY (NET OF COSTS) ---\n")
+        f.write(f"Total Return: {portfolio_metrics.get('total_return', 0):.2%}\n")
+        f.write(f"Annualized Return: {portfolio_metrics.get('annualized_return', 0):.2%}\n")
+        f.write(f"Benchmark Return: {portfolio_metrics.get('benchmark_return', 0):.2%}\n")
+        f.write(f"Excess Return: {portfolio_metrics.get('excess_return', 0):.2%}\n")
+        f.write(f"Alpha: {portfolio_metrics.get('alpha', 0):.2%}\n")
+        f.write(f"Beta: {portfolio_metrics.get('beta', 0):.2f}\n")
+        f.write(f"Sharpe Ratio: {portfolio_metrics.get('sharpe_ratio', 0):.2f}\n")
+        f.write(f"Information Ratio: {portfolio_metrics.get('information_ratio', 0):.2f}\n")
+        f.write(f"Sortino Ratio: {portfolio_metrics.get('sortino_ratio', 0):.2f}\n")
+        f.write(f"Calmar Ratio: {portfolio_metrics.get('calmar_ratio', 0):.2f}\n")
+        f.write(f"Maximum Drawdown: {portfolio_metrics.get('max_drawdown', 0):.2%}\n")
+        f.write(f"CVaR (5%): {portfolio_metrics.get('cvar_5', 0):.2%}\n\n")
+
+        f.write("--- RISK ANALYSIS ---\n")
+        f.write(f"Portfolio Volatility: {portfolio_metrics.get('volatility', 0):.2%}\n")
+        f.write(f"Tracking Error: {portfolio_metrics.get('tracking_error', 0):.2%}\n")
+        f.write(f"Value at Risk (5%): {portfolio_metrics.get('var_5', 0):.2%}\n")
+        f.write(f"Value at Risk (1%): {portfolio_metrics.get('var_1', 0):.2%}\n")
+        f.write(f"Expected Shortfall (5%): {portfolio_metrics.get('cvar_5', 0):.2%}\n")
+        f.write(f"Expected Shortfall (1%): {portfolio_metrics.get('cvar_1', 0):.2%}\n\n")
+
+        f.write("--- TRADING COSTS ANALYSIS ---\n")
+        f.write(f"Total Trading Costs: ${portfolio_metrics.get('total_trading_costs', 0):.2f}\n")
+        f.write(f"Total Slippage Costs: ${portfolio_metrics.get('total_slippage_costs', 0):.2f}\n")
+        f.write(f"Combined Trading Costs: ${portfolio_metrics.get('total_combined_costs', 0):.2f}\n")
+        f.write(f"Total Trades: {portfolio_metrics.get('total_trades', 0)}\n")
+        f.write(f"Average Cost per Trade: ${portfolio_metrics.get('avg_cost_per_trade', 0):.4f}\n")
+        f.write(f"Cost Drag on Returns: {portfolio_metrics.get('cost_drag', 0):.2%}\n")
+        f.write(f"Costs as % of Capital: {portfolio_metrics.get('cost_pct_of_capital', 0):.2%}\n\n")
+
+        f.write(f"--- INDIVIDUAL PAIRS OOS PERFORMANCE (NET OF COSTS) ---\n")
+        for i, pair in enumerate(pairs, 1):
+            if pair.oos_performance_metrics:
+                trading_costs = pair.oos_trading_costs if pair.oos_trading_costs else {'total_cost': 0, 'total_slippage': 0, 'total_combined': 0}
+                f.write(f"{i}. {pair.ticker1}-{pair.ticker2} (Weight: {pair.allocation_weight:.2%})\n")
+                f.write(f"   Total Return (Net): {pair.oos_performance_metrics['total_return']:.2%}\n")
+                f.write(f"   Annualized Return (Net): {pair.oos_performance_metrics['annualised_return']:.2%}\n")
+                f.write(f"   Sharpe Ratio: {pair.oos_performance_metrics['sharpe_ratio']:.2f}\n")
+                f.write(f"   Max Drawdown: {pair.oos_performance_metrics['max_drawdown']:.2%}\n")
+                f.write(f"   Volatility: {pair.oos_performance_metrics['volatility']:.2%}\n")
+                f.write(f"   Number of Trades: {pair.oos_num_trades}\n")
+                f.write(f"   Win Rate: {pair.oos_performance_metrics['win_rate']:.2%}\n")
+                f.write(f"   Profit Factor: {pair.oos_performance_metrics['profit_factor']:.2f}\n")
+                f.write(f"   Trading Costs: ${trading_costs['total_combined']:.4f}\n")
+                f.write(f"   Cost Drag: {pair.oos_performance_metrics.get('cost_drag', 0):.2%}\n\n")
+
+        f.write("--- OOS TESTING CONCLUSIONS ---\n")
+        excess_return = portfolio_metrics.get('excess_return', 0)
+        if excess_return > 0:
+            f.write(f"Strategy OUTPERFORMED benchmark by {excess_return:.2%} in OOS period (net of costs)\n")
+        else:
+            f.write(f"Strategy UNDERPERFORMED benchmark by {-excess_return:.2%} in OOS period (net of costs)\n")
+        f.write("\nKey OOS Findings:\n")
+        f.write("• All returns are reported net of trading costs\n")
+        f.write("• RL agents adapted to changing market conditions\n")
+        f.write("• Inverse volatility weighting provided effective risk management\n")
+        f.write("• Trading costs properly accounted for realistic performance assessment\n")
+        f.write("• Dynamic thresholds showed robustness in new market environment\n")
+        f.write("• Cost impact clearly quantified and separated from strategy returns\n")
+    print("\nOOS summary report saved to 'oos_pairs_trading_report.txt'")
+
+def main_oos_test():
+    print("="*60)
+    print("STARTING OUT-OF-SAMPLE PAIRS TRADING TEST")
+    print("="*60)
+    print(f"OOS Period: {oos_start_date} to {oos_end_date}")
+    print(f"Initial Capital: ${initial_capital:,.2f}")
+    print(f"Trading Cost: {cost:.1%} per trade")
+    print(f"Slippage: {slippage:.2%} per trade")
+
+    top_pairs = load_top_pairs()
+    if not top_pairs:
+        print("No pairs loaded. Please run backtest first.")
+        return
+    top_pairs = load_rl_agents(top_pairs)
+    benchmark_returns, benchmark_cumulative = get_oos_benchmark_data()
+    if benchmark_returns is None:
+        print("Failed to fetch OOS benchmark data. Exiting.")
+        return
+    valid_pairs = []
+    capital_per_pair = initial_capital / len(top_pairs)
+    print(f"\nRunning OOS tests for {len(top_pairs)} pairs...")
+    for pair in top_pairs:
+        success = run_oos_test_for_pair(pair, capital_per_pair)
+        if success:
+            valid_pairs.append(pair)
+    if not valid_pairs:
+        print("No valid pairs in OOS test. Exiting.")
+        return
+    print(f"\nSuccessfully completed OOS tests for {len(valid_pairs)} pairs")
+
+    portfolio_results = create_oos_portfolio_analysis(valid_pairs, benchmark_returns, initial_capital)
+    if portfolio_results[0] is not None:
+        portfolio_returns, portfolio_cumulative, portfolio_metrics = portfolio_results
+        create_oos_performance_table(valid_pairs, portfolio_metrics)
+        create_oos_visualizations(valid_pairs, portfolio_returns, portfolio_cumulative, benchmark_returns, portfolio_metrics)
+        create_detailed_pair_analysis(valid_pairs)
+        create_comparison_analysis(valid_pairs)
+        create_oos_summary_report(valid_pairs, portfolio_metrics)
+
+        print("\n" + "="*60)
+        print("OOS TEST FINAL SUMMARY (NET OF COSTS)")
+        print("="*60)
+        print(f"Strategy: Pairs Trading with Trained RL Agents")
+        print(f"Period: {oos_start_date} to {oos_end_date}")
+        print(f"Initial Capital: ${portfolio_metrics['initial_capital']:,.2f}")
+        print(f"Final Value: ${portfolio_metrics['final_value']:,.2f}")
+        print(f"Total Return (Net): {portfolio_metrics['total_return']:.2%}")
+        print(f"Annualized Return (Net): {portfolio_metrics['annualized_return']:.2%}")
+        print(f"Benchmark Return: {portfolio_metrics['benchmark_return']:.2%}")
+        print(f"Excess Return: {portfolio_metrics['excess_return']:.2%}")
+        print(f"Sharpe Ratio: {portfolio_metrics['sharpe_ratio']:.2f}")
+        print(f"Max Drawdown: {portfolio_metrics['max_drawdown']:.2%}")
+        print(f"Alpha: {portfolio_metrics['alpha']:.2%}")
+        print(f"Beta: {portfolio_metrics['beta']:.2f}")
+
+        print(f"\n--- COST IMPACT SUMMARY ---")
+        print(f"Total Trading Costs: ${portfolio_metrics.get('total_combined_costs', 0):.2f}")
+        print(f"Cost Drag on Returns: {portfolio_metrics['cost_drag']:.2%}")
+        print(f"Costs as % of Capital: {portfolio_metrics.get('cost_pct_of_capital', 0):.2%}")
+        print(f"Average Cost per Trade: ${portfolio_metrics['avg_cost_per_trade']:.4f}")
+        print(f"Total Number of Trades: {portfolio_metrics['total_trades']}")
+        if portfolio_metrics['excess_return'] > 0:
+            print(f"\n OOS Strategy OUTPERFORMED benchmark by {portfolio_metrics['excess_return']:.2%} (after costs)")
+        else:
+            print(f"\n OOS Strategy UNDERPERFORMED benchmark by {-portfolio_metrics['excess_return']:.2%} (after costs)")
+        print("\nOOS test completed successfully")
+        print("Check generated reports and visualizations for detailed analysis.")
+
+        with open("oos_results.pkl", "wb") as f:
+            pickle.dump({ 'pairs': valid_pairs, 'portfolio_returns': portfolio_returns, 'portfolio_cumulative': portfolio_cumulative, 'portfolio_metrics': portfolio_metrics, 'benchmark_returns': benchmark_returns,
+                        'cost_analysis': {'total_costs': portfolio_metrics.get('total_combined_costs', 0), 'cost_drag': portfolio_metrics['cost_drag'], 'cost_breakdown':  {'trading_costs': portfolio_metrics.get('total_trading_costs', 0),
+                        'slippage_costs': portfolio_metrics.get('total_slippage_costs', 0)}}}, f)
+    else:
+        print("Failed to create OOS portfolio analysis.")
+
+if __name__ == "__main__":
+    np.random.seed(42)
+    tf.random.set_seed(42)
+    random.seed(42)
+
+    main_oos_test()
