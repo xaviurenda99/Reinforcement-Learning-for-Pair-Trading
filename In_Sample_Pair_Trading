@@ -1,0 +1,954 @@
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from scipy.stats import zscore
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import coint
+from datetime import datetime, timedelta
+import warnings
+import itertools
+from tabulate import tabulate
+import pickle
+from collections import deque
+import random
+from tensorflow import keras
+from tensorflow.keras import layers
+import tensorflow as tf
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import time
+import seaborn as sns
+
+warnings.filterwarnings("ignore")
+
+# Global parameters
+start_date = '2015-01-01'
+end_date = '2024-01-01'
+risk_free = 0.04
+initial_entry_threshold = 1.5
+initial_exit_threshold = 0.75
+cost = 0.001
+slippage = 0.0005
+benchmark = '^GSPC'
+MIN_ANNUAL_RETURN = -0.05
+alpha = 4
+# RL parameters
+state_size = 10
+action_size = 9
+learning_rate = 0.001
+gamma = 0.95
+epsilon = 1.0
+epsilon_min = 0.01
+epsilon_decay = 0.995
+memory_size = 1000
+batch_size = 50
+replay_frequency = 10
+subsample_rate = 5
+# Pre-screening
+MAX_P_VALUE = 0.05
+MAX_HURST = 0.5
+MAX_HALF_LIFE = 50
+MIN_PAIR_SCORE = 0.50
+
+class StockPair:
+    def __init__(self, ticker1, ticker2):
+        self.ticker1 = ticker1
+        self.ticker2 = ticker2
+        self.performance_metrics = {}
+        self.hedge_ratio = None
+        self.p_value = None
+        self.is_cointegrated = False
+        self.data = None
+        self.signals = None
+        self.cumulative_returns = None
+        self.net_returns = None
+        self.drawdowns = None
+        self.pair_score = 0
+        self.rl_agent = None
+        self.state_history = []
+        self.action_history = []
+        self.reward_history = []
+        self.hurst = None
+        self.half_life = None
+        self.num_trades = 0
+        self.portfolio_value = None
+        self.dynamic_thresholds = None
+        self.trading_costs = None
+        self.risk_contribution = 0
+        self.allocation_weight = 0
+
+    def __str__(self):
+        return f"{self.ticker1}-{self.ticker2}"
+
+class DQNAgent:
+
+    def __init__(self, state_size, action_size, learning_rate=0.001):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = deque(maxlen=memory_size)
+        self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.model = self._build_model()
+        self.target_model = self._build_model()
+        self.update_target_model()
+        self.train_counter = 0
+
+    def _build_model(self):
+        model = keras.Sequential([layers.Input(shape=(self.state_size,)), layers.Dense(32, activation='relu'), layers.Dense(16, activation='relu'), layers.Dense(self.action_size, activation='linear')])
+        model.compile(loss='mse', optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate))
+        return model
+
+    def update_target_model(self):
+        self.target_model.set_weights(self.model.get_weights())
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randrange(self.action_size)
+        act_values = self.model.predict(state, verbose=0)
+        return np.argmax(act_values[0])
+
+    def replay(self, batch_size):
+        if len(self.memory) < batch_size:
+            return
+
+        minibatch = random.sample(self.memory, batch_size)
+        states = np.array([e[0] for e in minibatch]).reshape(batch_size, -1)
+        actions = np.array([e[1] for e in minibatch])
+        rewards = np.array([e[2] for e in minibatch])
+        next_states = np.array([e[3] for e in minibatch]).reshape(batch_size, -1)
+        dones = np.array([e[4] for e in minibatch])
+
+        targets = self.model.predict(states, verbose=0)
+        target_next = self.target_model.predict(next_states, verbose=0)
+
+        for i in range(batch_size):
+            if dones[i]:
+                targets[i][actions[i]] = rewards[i]
+            else:
+                targets[i][actions[i]] = rewards[i] + self.gamma * np.amax(target_next[i])
+
+        self.model.fit(states, targets, epochs=1, verbose=0, batch_size=batch_size)
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+# Dynamic thresholds
+def get_action_thresholds(action):
+    threshold_combinations = [
+        (1.0, 0.5),
+        (1.25, 0.5),
+        (1.5, 0.5),
+        (1.0, 0.75),
+        (1.25, 0.75),
+        (1.5, 0.75),
+        (1.75, 0.75),
+        (2.0, 0.75),
+        (2.0, 1.0)]
+    return threshold_combinations[action]
+
+def extract_state_features(data, lookback=20):
+    features = []
+    #Z-Scores computations lookback period
+    current_zscore = data['Spread_Zscore'].iloc[-1]
+    features.append(current_zscore)
+
+    recent_zscores = data['Spread_Zscore'].iloc[-lookback:]
+    features.extend([recent_zscores.mean(), recent_zscores.std(), recent_zscores.min(), recent_zscores.max()])
+    spread_returns = data['Spread'].pct_change().iloc[-lookback:]
+    features.extend([
+        spread_returns.mean(),
+        spread_returns.std()])
+    # Volatilities
+    price_vol1 = data.iloc[-lookback:, 0].pct_change().std()
+    price_vol2 = data.iloc[-lookback:, 1].pct_change().std()
+    features.extend([price_vol1, price_vol2])
+    # Mean Reversion
+    features.append(data['Spread'].iloc[-1] - data['Spread'].iloc[-lookback:].mean())
+    assert len(features) == 10, f"Expected 10 features, got {len(features)}"
+    features = [0 if np.isnan(f) or np.isinf(f) else f for f in features]
+
+    return np.array(features).reshape(1, -1)
+# Yahoo Finance Dawnload with normalisation of Prices
+def get_stock_data(stock_pair):
+    try:
+        tickers = f"{stock_pair.ticker1} {stock_pair.ticker2}"
+        data_dict = yf.download(tickers, start=start_date, end=end_date, interval='1d', progress=False, threads=True)
+
+        if data_dict.empty:
+            return None
+        data = pd.DataFrame()
+        if 'Close' in data_dict.columns.get_level_values(0):
+            data[f'{stock_pair.ticker1}_Close'] = data_dict['Close'][stock_pair.ticker1]
+            data[f'{stock_pair.ticker2}_Close'] = data_dict['Close'][stock_pair.ticker2]
+        else:
+            data[f'{stock_pair.ticker1}_Close'] = data_dict['Adj Close'][stock_pair.ticker1]
+            data[f'{stock_pair.ticker2}_Close'] = data_dict['Adj Close'][stock_pair.ticker2]
+
+        data = data.dropna()
+
+        if len(data) < 252:
+            return None
+        data[f'{stock_pair.ticker1}_Norm'] = data[f'{stock_pair.ticker1}_Close'] / data[f'{stock_pair.ticker1}_Close'].iloc[0]
+        data[f'{stock_pair.ticker2}_Norm'] = data[f'{stock_pair.ticker2}_Close'] / data[f'{stock_pair.ticker2}_Close'].iloc[0]
+
+        return data
+
+    except Exception as e:
+        return None
+
+def cointegration_test(data, stock_pair):
+    try:
+        score, p_value, _ = coint(data[f'{stock_pair.ticker1}_Norm'], data[f'{stock_pair.ticker2}_Norm'])
+        return p_value, p_value < MAX_P_VALUE
+    except:
+        return 1.0, False
+
+def calculate_hedge_ratio_and_spread(data, stock_pair):
+    model = sm.OLS(data[f'{stock_pair.ticker1}_Norm'], sm.add_constant(data[f'{stock_pair.ticker2}_Norm'])).fit()
+    hedge_ratio = model.params[f'{stock_pair.ticker2}_Norm']
+    # Spread and Z-Scores
+    data['Spread'] = data[f'{stock_pair.ticker1}_Norm'] - hedge_ratio * data[f'{stock_pair.ticker2}_Norm']
+    data['Spread_Zscore'] = zscore(data['Spread'])
+    # Half-Life of Mean Reversion
+    spread_lag = data['Spread'].shift(1).fillna(method='bfill')
+    spread_ret = data['Spread'] - spread_lag
+    spread_lag2 = sm.add_constant(spread_lag)
+    try:
+        model = sm.OLS(spread_ret[1:], spread_lag2[1:]).fit()
+        half_life = -np.log(2) / model.params[1] if model.params[1] < 0 else np.nan
+    except:
+        half_life = np.nan
+
+    return data, hedge_ratio, half_life
+
+def calculate_hurst_exponent(spread_series):
+    try:
+        lags = range(2, 50, 5)
+        tau = [np.std(np.subtract(spread_series[lag:], spread_series[:-lag])) for lag in lags]
+        m = np.polyfit(np.log(lags), np.log(tau), 1)
+        hurst = m[0] / 2.0
+
+        return hurst
+    except:
+        return 1.0
+#PreScreening Data
+def pre_screen_pair(stock_pair):
+    data = get_stock_data(stock_pair)
+    if data is None:
+        return False, None
+
+    p_value, is_cointegrated = cointegration_test(data, stock_pair)
+    if not is_cointegrated:
+        return False, None
+    data, hedge_ratio, half_life = calculate_hedge_ratio_and_spread(data, stock_pair)
+    if np.isnan(half_life) or half_life > MAX_HALF_LIFE or half_life <= 0:
+        return False, None
+    hurst = calculate_hurst_exponent(data['Spread'].values)
+    if hurst > MAX_HURST:
+        return False, None
+
+    stock_pair.p_value = p_value
+    stock_pair.hurst = hurst
+    stock_pair.half_life = half_life
+    stock_pair.hedge_ratio = hedge_ratio
+    stock_pair.is_cointegrated = True
+    return True, data
+
+def backtest_strategy_with_rl(data, hedge_ratio, stock_pair, initial_capital_per_pair):
+    signals = pd.Series(0, index=data.index)
+    position = 0
+    # Tracking Portfolio
+    portfolio_value = pd.Series(initial_capital_per_pair, index=data.index)
+    cash = initial_capital_per_pair
+    #Cost Tracking
+    dynamic_thresholds = pd.DataFrame(index=data.index, columns=['Entry_Threshold', 'Exit_Threshold'])
+    trading_costs_series = pd.Series(0.0, index=data.index)
+    trade_log = []
+    # RL Agent initialisation
+    if stock_pair.rl_agent is None:
+        stock_pair.rl_agent = DQNAgent(state_size, action_size)
+    episode_reward = 0
+    lookback = 20
+    train_counter = 0
+    trade_count = 0
+    total_trading_cost = 0
+    total_slippage_cost = 0
+    position_values = pd.Series(0.0, index=data.index)
+    # Signals for dynamic threshold
+    for i in range(lookback, len(data)):
+        current_date = data.index[i]
+        state = extract_state_features(data.iloc[:i+1], lookback)
+        action = stock_pair.rl_agent.act(state)
+        entry_threshold, exit_threshold = get_action_thresholds(action)
+        dynamic_thresholds.loc[current_date, 'Entry_Threshold'] = entry_threshold
+        dynamic_thresholds.loc[current_date, 'Exit_Threshold'] = exit_threshold
+        z_score = data['Spread_Zscore'].iloc[i]
+        prev_position = position
+        if z_score > entry_threshold and position == 0:
+            new_position = -1
+        elif z_score < -entry_threshold and position == 0:
+            new_position = 1
+        elif abs(z_score) < exit_threshold and position != 0:
+            new_position = 0
+        else:
+            new_position = position
+        signals.iloc[i] = new_position
+        # Portfolio value BEFORE costs
+        if i > lookback:
+            prev_date = data.index[i-1]
+            stock1_return = (data.iloc[i, 2] / data.iloc[i-1, 2]) - 1
+            stock2_return = (data.iloc[i, 3] / data.iloc[i-1, 3]) - 1
+            spread_return = stock1_return - hedge_ratio * stock2_return
+            if prev_position != 0:
+                position_return = prev_position * spread_return
+                position_values.iloc[i] = portfolio_value.iloc[i-1] * position_return
+            else:
+                position_return = 0
+                position_values.iloc[i] = 0
+            portfolio_value.iloc[i] = portfolio_value.iloc[i-1] * (1 + position_return)
+        # Portfolio Value AFTER costs
+        if new_position != prev_position:
+            trade_count += 1
+            current_portfolio_value = portfolio_value.iloc[i]
+            trade_cost = current_portfolio_value * cost
+            slippage_cost = current_portfolio_value * slippage
+            total_cost = trade_cost + slippage_cost
+            portfolio_value.iloc[i] -= total_cost
+            trading_costs_series.iloc[i] = total_cost
+            total_trading_cost += trade_cost
+            total_slippage_cost += slippage_cost
+
+            trade_log.append({
+                'date': current_date, 'from_position': prev_position, 'to_position': new_position, 'z_score': z_score, 'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold,
+                'trade_cost': trade_cost, 'slippage_cost': slippage_cost, 'total_cost': total_cost, 'portfolio_value_before': current_portfolio_value, 'portfolio_value_after': portfolio_value.iloc[i]})
+
+        position = new_position
+        if i > lookback and i % subsample_rate == 0:
+            current_portfolio = portfolio_value.iloc[i]
+            running_max = portfolio_value.iloc[:i+1].cummax().iloc[-1]
+            drawdown = (current_portfolio / running_max) - 1
+            period_return = (current_portfolio / portfolio_value.iloc[i-subsample_rate]) - 1 if i >= subsample_rate else 0
+            reward = period_return - alpha * abs(drawdown)
+            next_state = extract_state_features(data.iloc[:i+1], lookback) if i < len(data) - 1 else state
+            done = i == len(data) - 1
+            stock_pair.rl_agent.remember(state, action, reward, next_state, done)
+            train_counter += 1
+            if train_counter % replay_frequency == 0 and len(stock_pair.rl_agent.memory) > batch_size:
+                stock_pair.rl_agent.replay(batch_size)
+
+    if hasattr(stock_pair.rl_agent, 'update_target_model'):
+        stock_pair.rl_agent.update_target_model()
+
+    portfolio_returns = portfolio_value.pct_change().fillna(0)
+    net_returns = portfolio_returns.copy()
+    cumulative_returns = portfolio_value / initial_capital_per_pair
+    stock_pair.num_trades = trade_count
+    stock_pair.dynamic_thresholds = dynamic_thresholds
+    stock_pair.trading_costs = {'total_cost': total_trading_cost, 'total_slippage': total_slippage_cost, 'total_combined': total_trading_cost + total_slippage_cost, 'cost_per_trade': (total_trading_cost + total_slippage_cost) / max(trade_count, 1),
+        'total_trades': trade_count, 'cost_as_pct_of_capital': (total_trading_cost + total_slippage_cost) / initial_capital_per_pair, 'trade_log': trade_log, 'costs_series': trading_costs_series}
+    return signals, cumulative_returns, net_returns, trade_count, portfolio_value
+
+# Storage of RL agents for later use
+def save_rl_agents(pairs, filename="trained_rl_agents.pkl"):
+    agents_data = {}
+    for pair in pairs:
+        if pair.rl_agent is not None:
+            pair_key = f"{pair.ticker1}-{pair.ticker2}"
+            agent_data = {'model_weights': pair.rl_agent.model.get_weights(), 'target_model_weights': pair.rl_agent.target_model.get_weights(), 'epsilon': pair.rl_agent.epsilon, 'state_size': pair.rl_agent.state_size,
+                'action_size': pair.rl_agent.action_size, 'learning_rate': pair.rl_agent.learning_rate, 'gamma': pair.rl_agent.gamma, 'pair_score': pair.pair_score, 'hedge_ratio': pair.hedge_ratio, 'p_value': pair.p_value,
+                'hurst': pair.hurst, 'half_life': pair.half_life}
+            agents_data[pair_key] = agent_data
+    with open(filename, 'wb') as f:
+        pickle.dump(agents_data, f)
+    return filename
+# Stored RL agents for later use
+def load_rl_agents(pairs, filename="trained_rl_agents.pkl"):
+
+    try:
+        with open(filename, 'rb') as f:
+            agents_data = pickle.load(f)
+        loaded_count = 0
+        for pair in pairs:
+            pair_key = f"{pair.ticker1}-{pair.ticker2}"
+            if pair_key in agents_data:
+                agent_data = agents_data[pair_key]
+                pair.rl_agent = DQNAgent(state_size=agent_data['state_size'], action_size=agent_data['action_size'], learning_rate=agent_data['learning_rate'])
+                pair.rl_agent.model.set_weights(agent_data['model_weights'])
+                pair.rl_agent.target_model.set_weights(agent_data['target_model_weights'])
+                pair.rl_agent.epsilon = agent_data.get('epsilon_min', 0.01)
+                pair.hedge_ratio = agent_data.get('hedge_ratio')
+                pair.p_value = agent_data.get('p_value')
+                pair.hurst = agent_data.get('hurst')
+                pair.half_life = agent_data.get('half_life')
+                pair.pair_score = agent_data.get('pair_score', 0)
+                loaded_count += 1
+        return pairs
+    except FileNotFoundError:
+        return pairs
+    except Exception as e:
+        return pairs
+
+def analyse_performance(cumulative_returns, net_returns, stock_pair):
+
+    if len(cumulative_returns) == 0:
+        final_value = 0
+        total_return = 0
+        annualised_return = 0
+    else:
+        final_value = cumulative_returns.iloc[-1]
+        total_return = final_value - 1
+        years = len(cumulative_returns) / 252
+        if years > 0 and final_value > 0:
+            annualised_return = (final_value) ** (1/years) - 1
+        else:
+            annualised_return = 0
+    #Risk ANalsysis
+    daily_rfr = (1 + risk_free) ** (1 / 252) - 1
+    excess_returns = net_returns - daily_rfr
+    volatility = net_returns.std() * np.sqrt(252) if len(net_returns) > 0 else 0
+    if len(excess_returns) > 0 and excess_returns.std() != 0:
+        sharpe_ratio = excess_returns.mean() / excess_returns.std() * np.sqrt(252)
+    else:
+        sharpe_ratio = 0
+    # Drawdown
+    if len(cumulative_returns) > 0:
+        running_max = cumulative_returns.cummax()
+        drawdowns = cumulative_returns / running_max - 1
+        max_drawdown = drawdowns.min()
+    else:
+        drawdowns = pd.Series([0])
+        max_drawdown = 0
+    # Metrics related to performance
+    positive_returns = net_returns[net_returns > 0]
+    negative_returns = net_returns[net_returns < 0]
+    if len(net_returns[net_returns != 0]) > 0:
+        win_rate = len(positive_returns) / len(net_returns[net_returns != 0])
+    else:
+        win_rate = 0
+    if len(negative_returns) > 0 and negative_returns.sum() != 0:
+        profit_factor = abs(positive_returns.sum() / negative_returns.sum())
+    else:
+        profit_factor = np.inf if len(positive_returns) > 0 else 0
+    gross_return = total_return  # This is already net of costs
+    cost_drag = stock_pair.trading_costs['cost_as_pct_of_capital'] if stock_pair.trading_costs else 0
+    stock_pair.performance_metrics = {'total_return': total_return, 'annualised_return': annualised_return, 'volatility': volatility, 'sharpe_ratio': sharpe_ratio, 'max_drawdown': max_drawdown,
+        'win_rate': win_rate, 'profit_factor': profit_factor, 'final_value': final_value, 'cost_drag': cost_drag, 'gross_return': gross_return, 'net_return': total_return}
+    return drawdowns
+
+def calculate_risk_parity_weights(pairs):
+    volatilities = []
+    for pair in pairs:
+        if pair.net_returns is not None and len(pair.net_returns) > 0:
+            vol = pair.net_returns.std() * np.sqrt(252)
+            volatilities.append(vol)
+        else:
+            volatilities.append(0.01)
+    inv_volatilities = [1/vol if vol > 0 else 1 for vol in volatilities]
+    total_inv_vol = sum(inv_volatilities)
+    weights = [inv_vol / total_inv_vol for inv_vol in inv_volatilities]
+    for i, pair in enumerate(pairs):
+        pair.allocation_weight = weights[i]
+        pair.risk_contribution = volatilities[i] * weights[i]
+    return weights
+
+def calculate_cvar_and_es(returns, confidence_level=0.05):
+
+    if len(returns) == 0:
+        return 0, 0
+    sorted_returns = np.sort(returns)
+    var_index = int(confidence_level * len(sorted_returns))
+    var = sorted_returns[var_index] if var_index < len(sorted_returns) else sorted_returns[-1]
+    cvar = np.mean(sorted_returns[:var_index]) if var_index > 0 else var
+    return var, cvar
+
+def analyse_stock_pair(stock_pair, initial_capital_per_pair):
+
+    passed_screening, data = pre_screen_pair(stock_pair)
+    if not passed_screening:
+        return None
+    hedge_ratio = stock_pair.hedge_ratio
+    signals, cumulative_returns, net_returns, num_trades, portfolio_value = backtest_strategy_with_rl(data, hedge_ratio, stock_pair, initial_capital_per_pair)
+    drawdowns = analyse_performance(cumulative_returns, net_returns, stock_pair)
+    annual_return = stock_pair.performance_metrics.get('annualised_return', 0)
+    if annual_return < MIN_ANNUAL_RETURN:
+        return None
+
+    stock_pair.data = data
+    stock_pair.signals = signals
+    stock_pair.cumulative_returns = cumulative_returns
+    stock_pair.net_returns = net_returns
+    stock_pair.drawdowns = drawdowns
+    stock_pair.portfolio_value = portfolio_value
+    stock_pair.num_trades = num_trades
+
+    hurst_score = 1 - stock_pair.hurst if stock_pair.hurst < 0.5 else 0
+    half_life_score = min(1, max(0, 30 / stock_pair.half_life)) if not np.isnan(stock_pair.half_life) and stock_pair.half_life > 0 else 0
+    p_value_score = 1 - min(1, stock_pair.p_value * 20)
+    sharpe_score = min(1, max(0, stock_pair.performance_metrics['sharpe_ratio'] / 3))
+    drawdown_score = 1 - min(1, abs(stock_pair.performance_metrics['max_drawdown']) * 5)
+    profit_score = min(1, stock_pair.performance_metrics['profit_factor'] / 5) if stock_pair.performance_metrics['profit_factor'] != np.inf else 1
+    stock_pair.pair_score = (0.25 * p_value_score + 0.15 * hurst_score + 0.15 * half_life_score + 0.20 * sharpe_score + 0.15 * drawdown_score + 0.10 * profit_score)
+
+    if stock_pair.pair_score < MIN_PAIR_SCORE:
+        return None
+    print(f"Valid pair: {stock_pair.ticker1}-{stock_pair.ticker2} - Annual Return: {annual_return:.2%}, Score: {stock_pair.pair_score:.4f}")
+    return stock_pair
+
+def process_pair(args):
+    pair, capital_per_pair = args
+    try:
+        return analyse_stock_pair(pair, capital_per_pair)
+    except Exception as e:
+        return None
+# Generation of all possible pairs
+def analyse_multiple_pairs_parallel(ticker_list, initial_capital=100000, max_workers=None):
+    all_pairs = []
+    for ticker1, ticker2 in itertools.combinations(ticker_list, 2):
+        all_pairs.append(StockPair(ticker1, ticker2))
+    capital_per_pair = initial_capital / len(all_pairs)
+    if max_workers is None:
+        max_workers = min(cpu_count() - 1, 8)
+    start_time = time.time()
+    valid_pairs = []
+    args_list = [(pair, capital_per_pair) for pair in all_pairs]
+    batch_size = 50
+    total_batches = len(args_list) // batch_size + (1 if len(args_list) % batch_size else 0)
+    with Pool(processes=max_workers) as pool:
+        for i in range(0, len(args_list), batch_size):
+            batch = args_list[i:i+batch_size]
+            batch_num = i // batch_size + 1
+
+            print(f"\nProcessing batch {batch_num}/{total_batches}...")
+            results = pool.map(process_pair, batch)
+            for result in results:
+                if result is not None:
+                    valid_pairs.append(result)
+                    print(f"Valid pair found: {result} (Score: {result.pair_score:.4f})")
+    end_time = time.time()
+    print(f"Found {len(valid_pairs)} valid pairs out of {len(all_pairs)} total pairs")
+    #Sorting by Score all valid pairs
+    valid_pairs.sort(key=lambda x: x.pair_score, reverse=True)
+    return valid_pairs
+
+def get_benchmark_data():
+
+    benchmark_data = yf.download(benchmark, start=start_date, end=end_date, interval='1d', progress=False)
+    if benchmark_data.empty:
+      return None, None
+    close_col = 'Close' if 'Close' in benchmark_data.columns else 'Adj Close'
+    benchmark_data = benchmark_data[[close_col]].rename(columns={close_col: 'Close'})
+    benchmark_returns = benchmark_data['Close'].pct_change().dropna()
+    benchmark_cumulative = (1 + benchmark_returns).cumprod()
+    total_return = float(benchmark_cumulative.iloc[-1] - 1)
+    print(f"Benchmark total return: {total_return:.2%}")
+    return benchmark_returns, benchmark_cumulative
+
+def visualise_top_pairs_table(top_pairs):
+    if len(top_pairs) == 0:
+        return
+    fig, axes = plt.subplots(len(top_pairs) * 3, 1, figsize=(15, 12 * len(top_pairs)), sharex=False)
+    if len(top_pairs) == 1:
+        axes = [axes]
+    for idx, pair in enumerate(top_pairs):
+        if pair.data is None or pair.signals is None:
+            continue
+        data = pair.data
+        signals = pair.signals
+        r0 = idx * 3
+        ax1, ax2, ax3 = axes[r0], axes[r0+1], axes[r0+2]
+        ax1.plot(data.index, data.iloc[:, 2], label=pair.ticker1,
+                 color='blue', linewidth=1.5)
+        ax1.plot(data.index, data.iloc[:, 3], label=pair.ticker2,
+                 color='orange', linewidth=1.5)
+        ax1.set_title(f'Normalised Stock Prices: {pair.ticker1}-{pair.ticker2}')
+        ax1.set_ylabel('Price (Normalised)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        ax2.plot(data.index, data['Spread_Zscore'], color='blue',
+                 linewidth=1, label='Z-Score')
+        if pair.dynamic_thresholds is not None:
+            entry_thresholds = pair.dynamic_thresholds['Entry_Threshold'].ffill().bfill()
+            exit_thresholds  = pair.dynamic_thresholds['Exit_Threshold'].ffill().bfill()
+            ax2.plot(data.index, entry_thresholds, 'r--', alpha=0.7, label='Dynamic Entry')
+            ax2.plot(data.index, -entry_thresholds, 'r--', alpha=0.7)
+            ax2.plot(data.index, exit_thresholds, 'g--', alpha=0.7,
+                     label='Dynamic Exit')
+            ax2.plot(data.index, -exit_thresholds, 'g--', alpha=0.7)
+            stats_txt = (f"Entry: {entry_thresholds.mean():.2f}±{entry_thresholds.std():.2f}\n"
+                         f"Exit: {exit_thresholds.mean():.2f}±{exit_thresholds.std():.2f}")
+            ax2.text(0.02, 0.98, stats_txt, transform=ax2.transAxes, va='top', fontsize=8, bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        long_signals = signals[signals == 1]
+        short_signals = signals[signals == -1]
+        for j, dt in enumerate(long_signals.index):
+            ax2.scatter(dt, data.loc[dt, 'Spread_Zscore'], c='g', marker='^', s=50,
+                        label='Long '+pair.ticker1+', Short '+pair.ticker2 if j == 0 else "")
+        for j, dt in enumerate(short_signals.index):
+            ax2.scatter(dt, data.loc[dt, 'Spread_Zscore'], c='r', marker='v', s=50,
+                        label='Short '+pair.ticker1+', Long '+pair.ticker2 if j == 0 else "")
+        ax2.set_title('Z-Score with Dynamic RL Thresholds')
+        ax2.set_ylabel('Z-Score')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        ax3.plot(pair.cumulative_returns.index, pair.cumulative_returns, color='green', linewidth=2, label='Strategy Returns')
+        ax3.plot(pair.drawdowns.index, pair.drawdowns, color='red', linewidth=1, label='Drawdowns')
+        ax3.set_title('Strategy Performance & Risk Metrics')
+        ax3.set_ylabel('Value')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+
+        final_value = pair.performance_metrics.get('final_value', 1.0)
+        trading_costs = pair.trading_costs or {'total_cost': 0, 'total_slippage': 0, 'cost_per_trade': 0}
+        var_5, cvar_5 = calculate_cvar_and_es(pair.net_returns, 0.05)
+        metrics_text = f"""Final Value: {final_value:.3f}
+Total Return: {pair.performance_metrics['total_return']:.2%}
+Annualised Return: {pair.performance_metrics['annualised_return']:.2%}
+Sharpe Ratio: {pair.performance_metrics['sharpe_ratio']:.2f}
+Max Drawdown: {pair.performance_metrics['max_drawdown']:.2%}
+VaR (5%): {var_5:.2%}
+CVaR (5%): {cvar_5:.2%}
+Trades: {pair.num_trades}
+Cost/Trade: {trading_costs['cost_per_trade']:.4f}
+Total Costs: {trading_costs['total_cost']:.4f}
+P-Value: {pair.p_value:.4f}
+Hurst: {pair.hurst:.3f}
+Half-Life: {pair.half_life:.1f}d
+Risk Weight: {pair.allocation_weight:.2%}"""
+
+        ax3.text(0.02, 0.98, metrics_text, transform=ax3.transAxes,
+                 va='top', fontsize=8,
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    plt.tight_layout()
+    plt.show()
+
+
+def create_and_analyse_portfolio(top_pairs, benchmark_returns, max_pairs=10, initial_capital=100000):
+    if not top_pairs:
+        print("No valid pairs found for portfolio creation.")
+        return
+    top_pairs = top_pairs[:max_pairs]
+    risk_parity_weights = calculate_risk_parity_weights(top_pairs)
+    for i, (pair, weight) in enumerate(zip(top_pairs, risk_parity_weights)):
+        capital_allocated = initial_capital * weight
+    visualise_top_pairs_table(top_pairs)
+    portfolio_returns = pd.DataFrame()
+    for i, pair in enumerate(top_pairs):
+        if pair.net_returns is not None:
+            weighted_returns = pair.net_returns * risk_parity_weights[i]
+            portfolio_returns[f"{pair.ticker1}-{pair.ticker2}"] = weighted_returns
+    if not portfolio_returns.empty:
+        portfolio_returns['Portfolio'] = portfolio_returns.sum(axis=1)
+        portfolio_value = pd.Series(initial_capital, index=portfolio_returns.index)
+        for i in range(1, len(portfolio_returns)):
+            portfolio_value.iloc[i] = portfolio_value.iloc[i-1] * (1 + portfolio_returns['Portfolio'].iloc[i])
+        portfolio_cumulative = portfolio_value / initial_capital
+        final_portfolio_value = portfolio_value.iloc[-1]
+    else:
+        print("No valid returns data for portfolio creation.")
+        return None, None, None
+
+    portfolio_metrics = calculate_portfolio_metrics(portfolio_returns['Portfolio'], benchmark_returns, initial_capital, final_portfolio_value, top_pairs)
+    create_performance_table(top_pairs, portfolio_metrics)
+    visualise_portfolio(portfolio_returns, portfolio_cumulative, top_pairs, benchmark_returns)
+    return portfolio_returns, portfolio_cumulative, portfolio_metrics
+
+def calculate_portfolio_metrics(portfolio_returns, benchmark_returns, initial_capital, final_value, pairs):
+
+    aligned_data = pd.concat([portfolio_returns, benchmark_returns], axis=1).dropna()
+    if aligned_data.empty:
+        return {}
+    aligned_data.columns = ['Portfolio', 'Benchmark']
+    portfolio_cumulative = (1 + aligned_data['Portfolio']).cumprod()
+    benchmark_cumulative = (1 + aligned_data['Benchmark']).cumprod()
+    total_return = portfolio_cumulative.iloc[-1] - 1
+    benchmark_total = benchmark_cumulative.iloc[-1] - 1
+    excess_return = total_return - benchmark_total
+    years = len(aligned_data) / 252
+    if years > 0:
+        annualised_return = (portfolio_cumulative.iloc[-1]) ** (1/years) - 1
+        benchmark_ann = (benchmark_cumulative.iloc[-1]) ** (1/years) - 1
+    else:
+        annualised_return = 0
+        benchmark_ann = 0
+    ann_factor = np.sqrt(252)
+    portfolio_vol = aligned_data['Portfolio'].std() * ann_factor
+    benchmark_vol = aligned_data['Benchmark'].std() * ann_factor
+
+    # Risk-free rate
+    daily_rfr = (1 + risk_free) ** (1 / 252) - 1
+
+    # Sharpe ratio
+    excess_daily = aligned_data['Portfolio'] - daily_rfr
+    sharpe = (excess_daily.mean() / excess_daily.std()) * ann_factor if excess_daily.std() != 0 else 0
+
+    # Beta
+    covariance = np.cov(aligned_data['Portfolio'], aligned_data['Benchmark'])[0, 1]
+    benchmark_variance = np.var(aligned_data['Benchmark'])
+    beta = covariance / benchmark_variance if benchmark_variance != 0 else 0
+
+    # Alpha
+    alpha = annualised_return - (risk_free + beta * (benchmark_ann - risk_free))
+
+    # Information Ratio
+    tracking_error = (aligned_data['Portfolio'] - aligned_data['Benchmark']).std() * ann_factor
+    information_ratio = excess_return / tracking_error if tracking_error != 0 else 0
+
+    # Drawdown
+    drawdowns = portfolio_cumulative / portfolio_cumulative.cummax() - 1
+    max_drawdown = drawdowns.min()
+
+    # CVaR and Expected Shortfall
+    var_5, cvar_5 = calculate_cvar_and_es(aligned_data['Portfolio'], 0.05)
+    var_1, cvar_1 = calculate_cvar_and_es(aligned_data['Portfolio'], 0.01)
+    # Trading cost analysis
+    total_trading_costs = 0
+    total_slippage_costs = 0
+    total_combined_costs = 0
+    total_trades = 0
+    for pair in pairs:
+        if pair.trading_costs:
+            total_trading_costs += pair.trading_costs.get('total_cost', 0)
+            total_slippage_costs += pair.trading_costs.get('total_slippage', 0)
+            total_combined_costs += pair.trading_costs.get('total_combined', 0)
+            total_trades += pair.trading_costs.get('total_trades', 0)
+    avg_cost_per_trade = total_combined_costs / max(total_trades, 1)
+    cost_drag = total_combined_costs / initial_capital
+    cost_pct_of_capital = total_combined_costs / initial_capital
+    #Calmar Ratio, Negqative Returns, Downside Dev, Sortino Ratio
+    calmar_ratio = annualised_return / abs(max_drawdown) if max_drawdown != 0 else 0
+    negative_returns = aligned_data['Portfolio'][aligned_data['Portfolio'] < 0]
+    downside_deviation = negative_returns.std() * ann_factor if len(negative_returns) > 0 else 0
+    sortino_ratio = (annualised_return - risk_free) / downside_deviation if downside_deviation != 0 else 0
+    metrics = {'initial_capital': initial_capital, 'final_value': final_value, 'total_return': total_return, 'annualised_return': annualised_return, 'benchmark_return': benchmark_total, 'benchmark_annualised': benchmark_ann,
+        'excess_return': excess_return, 'alpha': alpha, 'beta': beta, 'volatility': portfolio_vol, 'benchmark_volatility': benchmark_vol, 'sharpe_ratio': sharpe, 'information_ratio': information_ratio, 'sortino_ratio': sortino_ratio,
+        'calmar_ratio': calmar_ratio, 'max_drawdown': max_drawdown, 'tracking_error': tracking_error, 'var_5': var_5, 'cvar_5': cvar_5, 'var_1': var_1, 'cvar_1': cvar_1, 'total_trading_costs': total_trading_costs, 'total_slippage_costs': total_slippage_costs,
+        'total_combined_costs': total_combined_costs, 'total_trades': total_trades, 'avg_cost_per_trade': avg_cost_per_trade, 'cost_drag': cost_drag, 'cost_pct_of_capital': cost_pct_of_capital}
+    return metrics
+
+def create_performance_table(top_pairs, portfolio_metrics):
+
+    print("\n" + "="*80)
+    print("PORTFOLIO PERFORMANCE METRICS")
+    print("="*80)
+    # Portfolio Overview
+    print(f"Initial Capital: ${portfolio_metrics['initial_capital']:,.2f}")
+    print(f"Final Portfolio Value: ${portfolio_metrics['final_value']:,.2f}")
+    print(f"Total Return (Net): {portfolio_metrics['total_return']:.2%}")
+    print(f"Annualised Return (Net): {portfolio_metrics['annualised_return']:.2%}")
+    # Benchmark Comparison
+    print(f"\nBenchmark ({benchmark}):")
+    print(f"Benchmark Total Return: {portfolio_metrics['benchmark_return']:.2%}")
+    print(f"Benchmark Annualised: {portfolio_metrics['benchmark_annualised']:.2%}")
+    print(f"Excess Return: {portfolio_metrics['excess_return']:.2%}")
+    print(f"Alpha: {portfolio_metrics['alpha']:.2%}")
+    print(f"Beta: {portfolio_metrics['beta']:.2f}")
+    # Risk Metrics
+    print(f"\nRisk Metrics:")
+    print(f"Portfolio Volatility: {portfolio_metrics['volatility']:.2%}")
+    print(f"Tracking Error: {portfolio_metrics['tracking_error']:.2%}")
+    print(f"Maximum Drawdown: {portfolio_metrics['max_drawdown']:.2%}")
+    print(f"VaR (5%): {portfolio_metrics['var_5']:.2%}")
+    print(f"CVaR (5%): {portfolio_metrics['cvar_5']:.2%}")
+    print(f"VaR (1%): {portfolio_metrics['var_1']:.2%}")
+    print(f"CVaR (1%): {portfolio_metrics['cvar_1']:.2%}")
+    # Performance Ratios
+    print(f"\nPerformance Ratios:")
+    print(f"Sharpe Ratio: {portfolio_metrics['sharpe_ratio']:.2f}")
+    print(f"Information Ratio: {portfolio_metrics['information_ratio']:.2f}")
+    print(f"Sortino Ratio: {portfolio_metrics['sortino_ratio']:.2f}")
+    print(f"Calmar Ratio: {portfolio_metrics['calmar_ratio']:.2f}")
+    print(f"Total Trades: {portfolio_metrics['total_trades']}")
+    # Individual Pairs Table cost reporting
+    print("Pairs Performance - Net of Costs")
+
+    metrics_table = []
+    for i, pair in enumerate(top_pairs, 1):
+        final_value = pair.performance_metrics.get('final_value', 1.0)
+        trading_costs = pair.trading_costs if pair.trading_costs else {'total_cost': 0, 'total_slippage': 0, 'total_combined': 0, 'cost_per_trade': 0, 'cost_as_pct_of_capital': 0}
+        var_5, cvar_5 = calculate_cvar_and_es(pair.net_returns, 0.05)
+        metrics_table.append([i, f"{pair.ticker1}-{pair.ticker2}", f"{pair.allocation_weight:.2%}", f"{final_value:.3f}", f"{pair.performance_metrics['total_return']:.2%}", f"{pair.performance_metrics['annualised_return']:.2%}",
+            f"{pair.performance_metrics['sharpe_ratio']:.2f}", f"{pair.performance_metrics['max_drawdown']:.2%}", f"{cvar_5:.2%}", f"{pair.num_trades}", f"{trading_costs['cost_per_trade']:.4f}", f"{trading_costs['cost_as_pct_of_capital']:.2%}",
+            f"{pair.pair_score:.3f}"])
+
+    print(tabulate(metrics_table,
+                  headers=["Rank", "Pair", "Weight", "Final Value", "Total Return", "Ann. Return", "Sharpe", "Max DD", "CVaR(5%)", "Trades", "Cost/Trade", "Cost Drag", "Score"], tablefmt="grid"))
+
+def visualise_portfolio(portfolio_returns, portfolio_cumulative, top_pairs, benchmark_returns):
+
+    benchmark_aligned = benchmark_returns.reindex(portfolio_returns.index).fillna(0)
+    benchmark_cumulative = (1 + benchmark_aligned).cumprod()
+    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+    #Portfolio vs Benchmark
+    ax1 = axes[0, 0]
+    ax1.plot(portfolio_cumulative.index, portfolio_cumulative,
+             label='Risk Parity Portfolio (RL)', linewidth=2, color='blue')
+    ax1.plot(benchmark_cumulative.index, benchmark_cumulative,
+             label=f'Benchmark ({benchmark})', linewidth=2, color='black')
+    ax1.set_title('Portfolio vs Benchmark Performance')
+    ax1.set_ylabel('Cumulative Return')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    # Risk Parity Allocation
+    ax2 = axes[0, 1]
+    pair_names = [f"{pair.ticker1}-{pair.ticker2}" for pair in top_pairs]
+    weights = [pair.allocation_weight for pair in top_pairs]
+    colors = plt.cm.Set3(np.linspace(0, 1, len(top_pairs)))
+    wedges, texts, autotexts = ax2.pie(weights, labels=pair_names, autopct='%1.1f%%', colors=colors, startangle=90)
+    ax2.set_title('Risk Parity Allocation')
+    # Individual Pairs Performance
+    ax3 = axes[1, 0]
+    for i, pair in enumerate(top_pairs):
+        if pair.cumulative_returns is not None:
+            ax3.plot(pair.cumulative_returns.index, pair.cumulative_returns,
+                    label=f"{pair.ticker1}-{pair.ticker2}", alpha=0.7, color=colors[i])
+    ax3.set_title('Individual Pairs Performance')
+    ax3.set_ylabel('Cumulative Return')
+    ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax3.grid(True, alpha=0.3)
+    # Rolling Sharpe Ratio
+    ax4 = axes[1, 1]
+    rolling_window = 60
+    if len(portfolio_returns) > rolling_window:
+        rolling_returns = portfolio_returns['Portfolio'].rolling(window=rolling_window)
+        rolling_sharpe = rolling_returns.mean() / rolling_returns.std() * np.sqrt(252)
+        ax4.plot(rolling_sharpe.index, rolling_sharpe,
+                label='Rolling Sharpe (60d)', linewidth=2, color='purple')
+        ax4.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        ax4.set_title('Rolling Sharpe Ratio')
+        ax4.set_ylabel('Sharpe Ratio')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+    plt.tight_layout()
+    # plt.savefig("portfolio_analysis.png", dpi=300, bbox_inches='tight')
+    plt.show()
+
+def create_summary_report(top_pairs, portfolio_metrics, benchmark_returns, max_pairs=10):
+    top_pairs = top_pairs[:max_pairs]
+    with open("pairs_trading_report.txt", "w") as f:
+        f.write("="*80 + "\n")
+        f.write("PAIRS TRADING PORTFOLIO ANALYSIS\n")
+        f.write("WITH REINFORCEMENT LEARNING & RISK PARITY ALLOCATION\n")
+        f.write("="*80 + "\n\n")
+        f.write(f"Analysis Period: {start_date} to {end_date}\n")
+        f.write(f"Benchmark: {benchmark}\n")
+        f.write(f"Initial Capital: ${portfolio_metrics.get('initial_capital', 0):,.2f}\n")
+        f.write(f"Final Portfolio Value: ${portfolio_metrics.get('final_value', 0):,.2f}\n")
+        f.write(f"Portfolio Strategy: Risk Parity + Dynamic RL Thresholds\n\n")
+        f.write("--- FEATURES ---\n")
+        f.write("• Dynamic threshold adaptation using Reinforcement Learning\n")
+        f.write("• Risk Parity allocation for optimal risk distribution\n")
+        f.write("• Comprehensive risk metrics (CVaR, Expected Shortfall)\n")
+        f.write("• Advanced performance ratios (Sortino, Calmar, Information)\n")
+        f.write("• Detailed trading cost analysis\n")
+        f.write("• Beta and alpha calculation vs benchmark\n\n")
+        f.write("--- PORTFOLIO PERFORMANCE SUMMARY ---\n")
+        f.write(f"Total Return: {portfolio_metrics.get('total_return', 0):.2%}\n")
+        f.write(f"Annualised Return: {portfolio_metrics.get('annualised_return', 0):.2%}\n")
+        f.write(f"Benchmark Return: {portfolio_metrics.get('benchmark_return', 0):.2%}\n")
+        f.write(f"Excess Return: {portfolio_metrics.get('excess_return', 0):.2%}\n")
+        f.write(f"Alpha: {portfolio_metrics.get('alpha', 0):.2%}\n")
+        f.write(f"Beta: {portfolio_metrics.get('beta', 0):.2f}\n")
+        f.write(f"Sharpe Ratio: {portfolio_metrics.get('sharpe_ratio', 0):.2f}\n")
+        f.write(f"Information Ratio: {portfolio_metrics.get('information_ratio', 0):.2f}\n")
+        f.write(f"Sortino Ratio: {portfolio_metrics.get('sortino_ratio', 0):.2f}\n")
+        f.write(f"Calmar Ratio: {portfolio_metrics.get('calmar_ratio', 0):.2f}\n")
+        f.write(f"Maximum Drawdown: {portfolio_metrics.get('max_drawdown', 0):.2%}\n")
+        f.write(f"CVaR (5%): {portfolio_metrics.get('cvar_5', 0):.2%}\n")
+        f.write(f"CVaR (1%): {portfolio_metrics.get('cvar_1', 0):.2%}\n\n")
+        f.write("--- TRADING COSTS ANALYSIS ---\n")
+        f.write(f"Total Trading Costs: ${portfolio_metrics.get('total_trading_costs', 0):.2f}\n")
+        f.write(f"Total Trades: {portfolio_metrics.get('total_trades', 0)}\n")
+        f.write(f"Average Cost per Trade: ${portfolio_metrics.get('avg_cost_per_trade', 0):.4f}\n")
+        f.write(f"Cost Drag on Returns: {portfolio_metrics.get('cost_drag', 0):.2%}\n\n")
+        f.write(f"--- TOP {len(top_pairs)} PAIRS WITH RISK PARITY WEIGHTS ---\n")
+        for i, pair in enumerate(top_pairs, 1):
+            final_value = pair.performance_metrics.get('final_value', 1.0)
+            trading_costs = pair.trading_costs if pair.trading_costs else {'total_cost': 0, 'total_slippage': 0}
+            var_5, cvar_5 = calculate_cvar_and_es(pair.net_returns, 0.05)
+            f.write(f"{i}. {pair.ticker1}-{pair.ticker2} (Weight: {pair.allocation_weight:.2%})\n")
+            f.write(f"   Final Value: {final_value:.3f}\n")
+            f.write(f"   Total Return: {pair.performance_metrics['total_return']:.2%}\n")
+            f.write(f"   Annualised Return: {pair.performance_metrics['annualised_return']:.2%}\n")
+            f.write(f"   Sharpe Ratio: {pair.performance_metrics['sharpe_ratio']:.2f}\n")
+            f.write(f"   Max Drawdown: {pair.performance_metrics['max_drawdown']:.2%}\n")
+            f.write(f"   CVaR (5%): {cvar_5:.2%}\n")
+            f.write(f"   Trading Costs: ${trading_costs['total_cost'] + trading_costs['total_slippage']:.4f}\n")
+            f.write(f"   Number of Trades: {pair.num_trades}\n")
+            f.write(f"   Cointegration p-value: {pair.p_value:.4f}\n")
+            f.write(f"   Hurst Exponent: {pair.hurst:.3f}\n")
+            f.write(f"   Half-life: {pair.half_life:.1f} days\n\n")
+        f.write("--- Conclusion ---\n")
+        excess_return = portfolio_metrics.get('excess_return', 0)
+        if excess_return > 0:
+            f.write(f"The strategy outperformed the benchmark by {excess_return:.2%}.\n")
+        else:
+            f.write(f"The strategy underperformed the benchmark by {-excess_return:.2%}.\n")
+        f.write("Key improvements over basic pairs trading:\n")
+        f.write("• Dynamic RL thresholds adapted to market conditions\n")
+        f.write("• Risk parity allocation optimised risk-adjusted returns\n")
+        f.write("• Comprehensive risk management with CVaR monitoring\n")
+        f.write("• Detailed cost analysis for realistic performance assessment\n")
+
+def main():
+
+    stocks = ['AAPL', 'MSFT', 'NVDA', 'AMZN', 'META', 'GOOGL', 'BRK-B', 'TSLA', 'JPM', 'WMT', 'UNH', 'XOM', 'V', 'PG', 'MA', 'JNJ', 'HD', 'COST', 'ABBV', 'CVX',
+              'MRK', 'KO', 'PEP', 'BAC', 'ADBE', 'CSCO', 'NFLX', 'DIS', 'TMO', 'ACN', 'MCD', 'IBM', 'GE', 'CAT', 'UPS', 'PM', 'NKE', 'AMD', 'QCOM', 'GS',
+              'SPGI', 'CMCSA', 'TXN', 'INTC', 'LOW', 'UNP', 'HON', 'ORCL', 'LMT', 'T']
+
+    initial_capital = 100000
+    print(f"Starting pairs trading analysis with {len(stocks)} stocks")
+    print(f"Initial capital: ${initial_capital:,.2f}")
+
+    #For reference
+    total_start_time = time.time()
+
+    benchmark_returns, benchmark_cumulative = get_benchmark_data()
+    if benchmark_returns is None:
+        return
+    valid_pairs = analyse_multiple_pairs_parallel(stocks, initial_capital)
+    if not valid_pairs:
+        return
+    save_rl_agents(valid_pairs, "trained_rl_agents.pkl")
+    top_n = min(10, len(valid_pairs))
+    top_pairs = valid_pairs[:top_n]
+    with open("top_pairs.pkl", "wb") as f:
+        pickle.dump(top_pairs, f)
+
+    portfolio_results = create_and_analyse_portfolio(top_pairs, benchmark_returns, max_pairs=top_n, initial_capital=initial_capital)
+    if portfolio_results[0] is not None:
+        portfolio_returns, portfolio_cumulative, portfolio_metrics = portfolio_results
+        create_summary_report(top_pairs, portfolio_metrics, benchmark_returns, max_pairs=top_n)
+    else:
+        return
+
+    print("\n" + "="*60)
+    print("FINAL PERFORMANCE SUMMARY")
+    print("="*60)
+    print(f"Strategy: Pairs Trading with RL + Risk Parity")
+    print(f"Initial Capital: ${portfolio_metrics['initial_capital']:,.2f}")
+    print(f"Final Value: ${portfolio_metrics['final_value']:,.2f}")
+    print(f"Total Return: {portfolio_metrics['total_return']:.2%}")
+    print(f"Benchmark Return: {portfolio_metrics['benchmark_return']:.2%}")
+    print(f"Excess Return: {portfolio_metrics['excess_return']:.2%}")
+    print(f"Sharpe Ratio: {portfolio_metrics['sharpe_ratio']:.2f}")
+    print(f"Max Drawdown: {portfolio_metrics['max_drawdown']:.2%}")
+    print(f"CVaR (5%): {portfolio_metrics['cvar_5']:.2%}")
+    if portfolio_metrics['excess_return'] > 0:
+        print(f"\n Strategy OUTPERFORMED benchmark by {portfolio_metrics['excess_return']:.2%}")
+    else:
+        print(f"\n Strategy UNDERPERFORMED benchmark by {-portfolio_metrics['excess_return']:.2%}")
+if __name__ == "__main__":
+    np.random.seed(42)
+    tf.random.set_seed(42)
+    random.seed(42)
+    main()
+
+
